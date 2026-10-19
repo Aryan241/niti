@@ -133,9 +133,135 @@ def parking_manoeuvre(pose):
     sensible is how a vehicle drives off.
     '''
 
-    # ADD YOUR CODE HERE
+    global _PARK_LAST_POSE, _PARK_LAST_STEERING, _PARK_LAST_SPEED
+    global _PARK_MISSES, _PARK_GOOD_FRAMES
+    global _PARK_START_LATERAL, _PARK_START_FORWARD
 
-    return 0.0, 0.0, False
+    limit = _parking_virtual_limit()
+    if pose is None:
+        _PARK_MISSES += 1
+        if _PARK_LAST_POSE is None:
+            steering = -0.24
+            speed = 0.38
+        else:
+            steering = _PARK_LAST_STEERING * (0.97 ** min(_PARK_MISSES, 30))
+            speed = max(0.16, min(_PARK_LAST_SPEED, 0.36))
+        if (_PARK_LAST_POSE is not None and _PARK_GOOD_FRAMES >= 8 and
+                _PARK_MISSES <= 12):
+            _PARK_LAST_STEERING = 0.0
+            _PARK_LAST_SPEED = 0.0
+            return 0.0, 0.0, True
+        if _PARK_MISSES >= 100:
+            steering = 0.0
+            speed = 0.0
+        steering = float(np.clip(steering, -limit, limit))
+        _PARK_LAST_STEERING = steering
+        _PARK_LAST_SPEED = speed
+        return steering, float(speed), False
+
+    try:
+        lateral = float(pose["lateral"])
+        heading = float(pose["heading"])
+        forward = float(pose["forward"])
+        bearing = float(pose.get("bearing", 0.0))
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return parking_manoeuvre(None)
+
+    values = np.asarray((lateral, heading, forward, bearing), dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        return parking_manoeuvre(None)
+
+    if (_PARK_LAST_POSE is not None and
+            forward > _PARK_LAST_POSE["forward"] + 0.08):
+        _PARK_GOOD_FRAMES = 0
+        _PARK_MISSES = 0
+        _PARK_LAST_STEERING = -0.24
+        _PARK_START_LATERAL = lateral
+        _PARK_START_FORWARD = forward
+
+    if _PARK_START_LATERAL is None or _PARK_START_FORWARD is None:
+        _PARK_START_LATERAL = lateral
+        _PARK_START_FORWARD = forward
+
+    _PARK_MISSES = 0
+    _PARK_LAST_POSE = {"lateral": lateral, "heading": heading,
+                       "forward": forward, "bearing": bearing}
+
+    lateral_error = float(lateral)
+    heading_error = float(np.clip(heading, -np.pi / 2.0, np.pi / 2.0))
+    path_end_forward = BAY_MOUTH_FORWARD + 0.06
+    path_span = max(_PARK_START_FORWARD - path_end_forward, 0.30)
+    path_ratio = float(np.clip((forward - path_end_forward) / path_span,
+                               0.0, 1.0))
+    smooth_path = (3.0 * path_ratio * path_ratio -
+                   2.0 * path_ratio * path_ratio * path_ratio)
+    lateral_reference = _PARK_START_LATERAL * smooth_path
+    path_slope = (_PARK_START_LATERAL *
+                  (6.0 * path_ratio - 6.0 * path_ratio * path_ratio) /
+                  path_span)
+    heading_reference = -float(np.arctan(path_slope))
+    steering_scale = 0.90 if abs(_PARK_START_LATERAL) > 0.30 else 1.0
+    steering = steering_scale * (4.5 * (heading_reference - heading_error) -
+                                 8.0 * (lateral_error - lateral_reference))
+    steering = float(np.clip(steering, -limit, limit))
+
+    footprint_clearance = (BAY_WIDTH - 0.18) / 2.0
+    footprint_margin = -0.003
+    footprint_error = abs(lateral) + WHEELBASE * abs(np.sin(heading))
+    strictly_inside = footprint_error <= footprint_clearance - footprint_margin
+    aligned = abs(lateral) <= 0.026 and abs(heading) <= 0.085
+    at_target = (forward <= BAY_MIDDLE_FORWARD + 0.012 and
+                 forward >= BAY_MIDDLE_FORWARD - 0.070)
+    if strictly_inside and aligned and at_target:
+        _PARK_GOOD_FRAMES += 1
+    else:
+        _PARK_GOOD_FRAMES = 0
+    if _PARK_GOOD_FRAMES >= 8:
+        _PARK_LAST_STEERING = 0.0
+        _PARK_LAST_SPEED = 0.0
+        return 0.0, 0.0, True
+
+    if at_target and strictly_inside and aligned:
+        _PARK_LAST_STEERING = steering
+        _PARK_LAST_SPEED = 0.0
+        return steering, 0.0, False
+
+    if forward < BAY_MIDDLE_FORWARD - 0.080:
+        _PARK_LAST_STEERING = 0.0
+        _PARK_LAST_SPEED = 0.0
+        return 0.0, 0.0, False
+
+    if forward > BAY_MOUTH_FORWARD + 0.06:
+        speed = 0.92
+    elif forward > BAY_MOUTH_FORWARD - 0.04:
+        speed = 0.62
+    elif forward > BAY_MIDDLE_FORWARD + 0.045:
+        speed = 0.42
+    else:
+        speed = 0.24
+
+    if not aligned:
+        speed = min(speed, 0.48 if forward <= BAY_MOUTH_FORWARD else 0.68)
+    if abs(steering) > 0.80 * limit:
+        speed = min(speed, 0.48)
+
+    _PARK_LAST_STEERING = steering
+    _PARK_LAST_SPEED = float(speed)
+    return steering, float(speed), False
+
+
+_PARK_LAST_POSE = None
+_PARK_LAST_STEERING = -0.24
+_PARK_LAST_SPEED = 0.38
+_PARK_MISSES = 0
+_PARK_GOOD_FRAMES = 0
+_PARK_START_LATERAL = None
+_PARK_START_FORWARD = None
+
+
+def _parking_virtual_limit():
+    return float(np.arctan(WHEELBASE /
+                           (WHEELBASE + (TRACK_WIDTH - 2.0 * WHEEL_OFFSET) / 2.0)) - 1e-3)
 
 
 ##############################################################

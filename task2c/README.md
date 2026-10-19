@@ -40,8 +40,8 @@ does not fit: `lateral` and `heading` both have to reach zero.
 Open `Task_2C.ttt` in CoppeliaSim, leave the simulation **stopped**, then:
 
 ```sh
-conda activate NV_<Team-ID>
-cd ~/eYRC_26-27_Niti-Vahan/task2c
+conda activate <your-environment>
+cd ~/your-project/task2c
 python task2c.py --bay 0
 ```
 

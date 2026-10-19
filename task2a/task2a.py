@@ -93,9 +93,62 @@ def detect_lane(frame):
     on staying the correct side of the dashed line.
     '''
 
-    # ADD YOUR CODE HERE
+    global _LANE_TRACK
 
-    return None
+    if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+        return {"valid": False, "lane": "unknown", "center_near": 0.0,
+                "center_far": 0.0, "image_center": 0.0}
+
+    height, width = frame.shape[:2]
+    yellow, white = _lane_masks(frame)
+    y_min = int(height * 0.42)
+    y_max = int(height * 0.90)
+
+    yellow_models = _solid_line_models(yellow, y_min, y_max, 180, 32)
+    white_points = _dashed_line_points(white, height, width)
+    white_models = _dashed_line_models(white_points, height, width)
+    pair = _choose_lane_pair(yellow_models, white_models, height, width)
+
+    if pair is None:
+        return {"valid": False, "lane": "unknown", "center_near": width * 0.5,
+                "center_far": width * 0.5, "image_center": width * 0.5}
+
+    outer_model, divider_model, lane_side = pair
+    reference_rows = (height * 0.62, height * 0.74, height * 0.84)
+    centres = [(row, 0.5 * (_model_x(outer_model, row, height) +
+                             _model_x(divider_model, row, height)))
+               for row in reference_rows]
+    if not all(np.isfinite(value) for _, value in centres):
+        return {"valid": False, "lane": lane_side, "center_near": width * 0.5,
+                "center_far": width * 0.5, "image_center": width * 0.5}
+
+    centre_model = _fit_point_model(np.asarray(centres, dtype=np.float32), height)
+    near = _model_x(centre_model, height * 0.84, height)
+    far = _model_x(centre_model, height * 0.60, height)
+    valid = bool(np.isfinite(near) and np.isfinite(far))
+    if not valid:
+        return {"valid": False, "lane": lane_side,
+                "center_near": width * 0.5, "center_far": width * 0.5,
+                "image_center": width * 0.5}
+
+    uncertain = False
+    if _LANE_TRACK is not None:
+        lane_changed = lane_side != _LANE_TRACK["lane"]
+        if lane_changed:
+            # Each evaluated lap starts a fresh controller process, so the
+            # lane identity must remain fixed for that run. At a tight bend
+            # the visible outer edge can fragment and look like the opposite
+            # lane; switching here reverses the steering direction.
+            uncertain = True
+            near = _LANE_TRACK["near"]
+            far = _LANE_TRACK["far"]
+            lane_side = _LANE_TRACK["lane"]
+
+    _LANE_TRACK = {"lane": lane_side, "near": float(near),
+                   "far": float(far)}
+    return {"valid": True, "lane": lane_side, "center_near": float(near),
+            "center_far": float(far), "image_center": width * 0.5,
+            "uncertain": uncertain}
 
 
 def compute_control(detection, stop_requested):
@@ -147,9 +200,175 @@ def compute_control(detection, stop_requested):
     defensible - doing nothing is not.
     '''
 
-    # ADD YOUR CODE HERE
+    global _LAST_SPEED, _LAST_WHEELS, _INVALID_FRAMES
 
-    return 0.0, 0.0, 0.0
+    if bool(stop_requested):
+        return float(_LAST_WHEELS[0]), float(_LAST_WHEELS[1]), 0.0
+
+    valid = isinstance(detection, dict) and detection.get("valid", False)
+    if not valid:
+        return _invalid_control()
+
+    try:
+        scale = max(float(detection["image_center"]) * 2.0, 1.0)
+        near_error = (float(detection["center_near"]) -
+                      float(detection["image_center"])) / scale
+        far_error = (float(detection["center_far"]) -
+                     float(detection["image_center"])) / scale
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return _invalid_control()
+
+    if not np.isfinite(near_error) or not np.isfinite(far_error):
+        return _invalid_control()
+
+    _INVALID_FRAMES = 0
+    virtual_limit = _virtual_steering_limit()
+    virtual = -2.05 * near_error - 1.35 * (far_error - near_error)
+    virtual = float(np.clip(virtual, -virtual_limit, virtual_limit))
+    left_angle, right_angle = _ackermann_angles(virtual)
+    _LAST_WHEELS = (left_angle, right_angle)
+
+    turn_fraction = min(abs(virtual) / virtual_limit, 1.0)
+    _LAST_SPEED = 1.22 * (1.0 - 0.80 * turn_fraction)
+    if turn_fraction > 0.55:
+        _LAST_SPEED = min(_LAST_SPEED, 0.42 - 0.35 * (turn_fraction - 0.55))
+    if bool(detection.get("uncertain", False)):
+        _LAST_SPEED = min(_LAST_SPEED, 0.28)
+    _LAST_SPEED = float(np.clip(_LAST_SPEED, 0.24, 1.22))
+    return float(left_angle), float(right_angle), float(_LAST_SPEED)
+
+
+_LAST_SPEED = 1.0
+_LAST_WHEELS = (0.0, 0.0)
+_INVALID_FRAMES = 0
+_LANE_TRACK = None
+
+
+def _invalid_control():
+    global _LAST_SPEED, _INVALID_FRAMES, _LANE_TRACK
+    _INVALID_FRAMES += 1
+    if _INVALID_FRAMES >= 8:
+        _LANE_TRACK = None
+        _LAST_SPEED = 0.0
+        return float(_LAST_WHEELS[0]), float(_LAST_WHEELS[1]), 0.0
+    _LAST_SPEED = max(0.45, _LAST_SPEED * 0.72)
+    return float(_LAST_WHEELS[0]), float(_LAST_WHEELS[1]), float(_LAST_SPEED)
+
+
+def _lane_masks(frame):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yellow = cv2.inRange(hsv, (18, 105, 105), (43, 255, 255))
+    white = cv2.inRange(hsv, (0, 0, 165), (179, 105, 255))
+    kernel = np.ones((3, 3), np.uint8)
+    yellow = cv2.morphologyEx(yellow, cv2.MORPH_CLOSE, kernel)
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, kernel)
+    return yellow, white
+
+
+def _solid_line_models(mask, y_min, y_max, min_area, min_height):
+    work = mask.copy()
+    work[:y_min] = 0
+    work[y_max:] = 0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(work, 8)
+    models = []
+    for index in range(1, count):
+        x, y, width, height, area = stats[index]
+        if area < min_area or height < min_height:
+            continue
+        ys, xs = np.where(labels == index)
+        if len(xs) < 20:
+            continue
+        points = np.column_stack((ys, xs)).astype(np.float32)
+        model = _fit_point_model(points, mask.shape[0])
+        model["score"] = float(area) * float(height)
+        models.append(model)
+    return models
+
+
+def _dashed_line_points(mask, height, width):
+    work = mask.copy()
+    work[:int(height * 0.50)] = 0
+    work[int(height * 0.87):] = 0
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(work, 8)
+    points = []
+    for index in range(1, count):
+        x, y, component_width, component_height, area = stats[index]
+        if area < 30 or component_height < 5 or component_width < 4:
+            continue
+        if component_width > width * 0.35:
+            continue
+        ys, xs = np.where(labels == index)
+        points.append((float(np.mean(ys)), float(np.mean(xs)), float(area)))
+    return points
+
+
+def _dashed_line_models(points, height, width):
+    if len(points) < 2:
+        return []
+    all_points = np.asarray(points, dtype=np.float32)[:, :2]
+    models = [_fit_point_model(all_points, height)]
+    left = all_points[all_points[:, 1] < width * 0.54]
+    right = all_points[all_points[:, 1] > width * 0.46]
+    if len(left) >= 2:
+        models.append(_fit_point_model(left, height))
+    if len(right) >= 2:
+        models.append(_fit_point_model(right, height))
+    return models
+
+
+def _choose_lane_pair(yellow_models, white_models, height, width):
+    if not yellow_models or not white_models:
+        return None
+    reference = height * 0.78
+    candidates = []
+    for yellow_model in yellow_models:
+        for white_model in white_models:
+            outer = _model_x(yellow_model, reference, height)
+            divider = _model_x(white_model, reference, height)
+            width_px = abs(divider - outer)
+            centre = 0.5 * (divider + outer)
+            if not (np.isfinite(outer) and np.isfinite(divider)):
+                continue
+            if width * 0.16 <= width_px <= width * 0.96:
+                centre_cost = abs(centre - width * 0.5) / width
+                width_cost = abs(width_px - width * 0.67) / width
+                score = centre_cost + 0.28 * width_cost
+                candidates.append((score, yellow_model, white_model,
+                                   "left" if outer < divider else "right"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    _, outer_model, divider_model, side = candidates[0]
+    return outer_model, divider_model, side
+
+
+def _fit_point_model(points, height):
+    points = np.asarray(points, dtype=np.float32)
+    degree = min(2, len(points) - 1)
+    yn = (points[:, 0] - height * 0.70) / max(height * 0.25, 1.0)
+    coefficients = np.polyfit(yn, points[:, 1], degree)
+    return {"coefficients": coefficients, "height": float(height)}
+
+
+def _model_x(model, row, height):
+    coefficients = model["coefficients"]
+    yn = (float(row) - height * 0.70) / max(height * 0.25, 1.0)
+    return float(np.polyval(coefficients, yn))
+
+
+def _virtual_steering_limit():
+    return float(np.arctan(0.120 / (0.120 + 0.055 / 2.0)) - 1e-3)
+
+
+def _ackermann_angles(delta):
+    wheelbase = 0.120
+    effective_track = 0.110 - 2.0 * 0.0275
+    sine, cosine = np.sin(delta), np.cos(delta)
+    left = np.arctan2(2.0 * wheelbase * sine,
+                       2.0 * wheelbase * cosine - effective_track * sine)
+    right = np.arctan2(2.0 * wheelbase * sine,
+                        2.0 * wheelbase * cosine + effective_track * sine)
+    return float(left), float(right)
 
 
 ##############################################################

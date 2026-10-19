@@ -1,7 +1,5 @@
 # Task 2B - Sign & Obstacle Detection Boilerplate
 
-Niti Vahan (NV), eYRC 2026-27.
-
 ## Files
 
 | File | What it is |
@@ -12,7 +10,7 @@ Niti Vahan (NV), eYRC 2026-27.
 
 ## Requirements
 
-Your `NV_<Team-ID>` environment from Task 0 already has what you need:
+Your project environment already has what you need:
 
 ```sh
 conda activate NV_<Team-ID>
@@ -40,7 +38,6 @@ def detect_obstacle(image):
 Both functions must only compute and return. No `cv2.imshow()`, `cv2.waitKey()`,
 `cv2.imwrite()` or `print()` inside them - reading images and reporting results is
 the evaluator's job, not this file's. There is no `main()` here to run directly;
-use the evaluation tool (`eyantra-autoeval evaluate --task 2b`) to run your code
-against the public images.
+use the provided evaluation tool to run your code against the public images.
 
 Full instructions are in the theme book.

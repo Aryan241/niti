@@ -1,7 +1,5 @@
 # Task 2A - Arena Navigation Boilerplate
 
-Niti Vahan (NV), eYRC 2026-27.
-
 ## Files
 
 | File | What it is |
@@ -11,7 +9,7 @@ Niti Vahan (NV), eYRC 2026-27.
 
 ## Requirements
 
-Your `NV_<Team-ID>` environment from Task 0 already has what you need - nothing
+Your project environment already has what you need - nothing
 new to install since Task 1:
 
 ```sh
