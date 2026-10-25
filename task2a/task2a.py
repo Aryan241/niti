@@ -135,10 +135,6 @@ def detect_lane(frame):
     if _LANE_TRACK is not None:
         lane_changed = lane_side != _LANE_TRACK["lane"]
         if lane_changed:
-            # Each evaluated lap starts a fresh controller process, so the
-            # lane identity must remain fixed for that run. At a tight bend
-            # the visible outer edge can fragment and look like the opposite
-            # lane; switching here reverses the steering direction.
             uncertain = True
             near = _LANE_TRACK["near"]
             far = _LANE_TRACK["far"]
