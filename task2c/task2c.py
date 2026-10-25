@@ -151,7 +151,7 @@ def parking_manoeuvre(pose):
             _PARK_LAST_STEERING = 0.0
             _PARK_LAST_SPEED = 0.0
             return 0.0, 0.0, True
-        if _PARK_MISSES >= 100:
+        if _PARK_MISSES >= 300:
             steering = 0.0
             speed = 0.0
         steering = float(np.clip(steering, -limit, limit))
@@ -187,9 +187,9 @@ def parking_manoeuvre(pose):
     _PARK_LAST_POSE = {"lateral": lateral, "heading": heading,
                        "forward": forward, "bearing": bearing}
 
-    lateral_error = float(lateral)
+    lateral_error = float(lateral - WHEELBASE * np.sin(heading))
     heading_error = float(np.clip(heading, -np.pi / 2.0, np.pi / 2.0))
-    path_end_forward = BAY_MOUTH_FORWARD + 0.06
+    path_end_forward = BAY_MOUTH_FORWARD + 0.13
     path_span = max(_PARK_START_FORWARD - path_end_forward, 0.30)
     path_ratio = float(np.clip((forward - path_end_forward) / path_span,
                                0.0, 1.0))
@@ -200,18 +200,30 @@ def parking_manoeuvre(pose):
                   (6.0 * path_ratio - 6.0 * path_ratio * path_ratio) /
                   path_span)
     heading_reference = -float(np.arctan(path_slope))
-    steering_scale = 0.90 if abs(_PARK_START_LATERAL) > 0.30 else 1.0
-    steering = steering_scale * (4.5 * (heading_reference - heading_error) -
-                                 8.0 * (lateral_error - lateral_reference))
+    path_second = (_PARK_START_LATERAL * (6.0 - 12.0 * path_ratio) /
+                   (path_span * path_span)) if 0.0 < path_ratio < 1.0 else 0.0
+    curvature = path_second / (1.0 + path_slope * path_slope) ** 1.5
+    lateral_gain = 45.0 if forward < path_end_forward else 7.0
+    heading_gain = 4.0 if forward < path_end_forward else 2.8
+    steering = (float(np.arctan(WHEELBASE * curvature)) +
+                heading_gain * (heading_reference - heading_error) -
+                lateral_gain * (lateral_error - lateral_reference))
+    if heading_error < -0.65:
+        steering = max(steering, 3.0 * (-0.65 - heading_error))
+    elif heading_error > 0.65:
+        steering = min(steering, 3.0 * (0.65 - heading_error))
+    if bearing > 0.42:
+        steering = max(steering, 3.0 * (bearing - 0.42))
+    elif bearing < -0.42:
+        steering = min(steering, 3.0 * (bearing + 0.42))
     steering = float(np.clip(steering, -limit, limit))
 
     footprint_clearance = (BAY_WIDTH - 0.18) / 2.0
-    footprint_margin = -0.003
+    footprint_margin = 0.004
     footprint_error = abs(lateral) + WHEELBASE * abs(np.sin(heading))
     strictly_inside = footprint_error <= footprint_clearance - footprint_margin
-    aligned = abs(lateral) <= 0.026 and abs(heading) <= 0.085
-    at_target = (forward <= BAY_MIDDLE_FORWARD + 0.012 and
-                 forward >= BAY_MIDDLE_FORWARD - 0.070)
+    aligned = abs(lateral) <= 0.008 and abs(heading) <= 0.035
+    at_target = abs(forward - BAY_MIDDLE_FORWARD) <= 0.008
     if strictly_inside and aligned and at_target:
         _PARK_GOOD_FRAMES += 1
     else:
@@ -226,24 +238,27 @@ def parking_manoeuvre(pose):
         _PARK_LAST_SPEED = 0.0
         return steering, 0.0, False
 
-    if forward < BAY_MIDDLE_FORWARD - 0.080:
+    if forward < BAY_MIDDLE_FORWARD - 0.008:
         _PARK_LAST_STEERING = 0.0
         _PARK_LAST_SPEED = 0.0
         return 0.0, 0.0, False
 
     if forward > BAY_MOUTH_FORWARD + 0.06:
-        speed = 0.92
+        speed = 1.15
     elif forward > BAY_MOUTH_FORWARD - 0.04:
-        speed = 0.62
+        speed = 0.80
     elif forward > BAY_MIDDLE_FORWARD + 0.045:
-        speed = 0.42
+        speed = 0.65
     else:
-        speed = 0.24
+        speed = 0.30
+
+    if forward < BAY_MIDDLE_FORWARD + 0.035:
+        speed = float(np.clip(9.0 * (forward - BAY_MIDDLE_FORWARD), 0.08, 0.30))
 
     if not aligned:
-        speed = min(speed, 0.48 if forward <= BAY_MOUTH_FORWARD else 0.68)
+        speed = min(speed, 0.65 if forward <= BAY_MOUTH_FORWARD else 0.90)
     if abs(steering) > 0.80 * limit:
-        speed = min(speed, 0.48)
+        speed = min(speed, 0.65)
 
     _PARK_LAST_STEERING = steering
     _PARK_LAST_SPEED = float(speed)
