@@ -1,0 +1,152 @@
+{
+    "generate": true,
+    "os_info": {
+        "name": "Darwin",
+        "version": "Darwin Kernel Version 25.1.0: Mon Oct 20 19:32:56 PDT 2025; root:xnu-12377.41.6~2/RELEASE_ARM64_T8132",
+        "machine": "arm64"
+    },
+    "python": "3.10.20",
+    "opencv": "5.0.0",
+    "rows": [
+        {
+            "image": "40_1.png",
+            "signs": [
+                {
+                    "label": "Speed40",
+                    "area": 1357
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "40_2.png",
+            "signs": [
+                {
+                    "label": "Speed40",
+                    "area": 4856
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "40_P_1.png",
+            "signs": [
+                {
+                    "label": "Parking",
+                    "area": 2552
+                },
+                {
+                    "label": "Speed40",
+                    "area": 1238
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Blank_1.png",
+            "signs": [],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "H_1.png",
+            "signs": [
+                {
+                    "label": "Hospital",
+                    "area": 3956
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Obs_1.png",
+            "signs": [],
+            "obstacle": {
+                "present": true,
+                "area": 12452
+            }
+        },
+        {
+            "image": "Obs_H_1.png",
+            "signs": [
+                {
+                    "label": "Hospital",
+                    "area": 6168
+                }
+            ],
+            "obstacle": {
+                "present": true,
+                "area": 4536
+            }
+        },
+        {
+            "image": "Obs_H_2.png",
+            "signs": [
+                {
+                    "label": "Hospital",
+                    "area": 1152
+                }
+            ],
+            "obstacle": {
+                "present": true,
+                "area": 1460
+            }
+        },
+        {
+            "image": "P_1.png",
+            "signs": [
+                {
+                    "label": "Parking",
+                    "area": 1259
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Sc_1.png",
+            "signs": [
+                {
+                    "label": "School",
+                    "area": 2622
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        },
+        {
+            "image": "Sc_2.png",
+            "signs": [
+                {
+                    "label": "School",
+                    "area": 1601
+                }
+            ],
+            "obstacle": {
+                "present": false,
+                "area": 0
+            }
+        }
+    ],
+    "meta": {
+        "evaluation_time": 0.3401801586151123
+    }
+}

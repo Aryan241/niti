@@ -1,0 +1,101 @@
+{
+    "generate": true,
+    "os_info": {
+        "name": "Darwin",
+        "version": "Darwin Kernel Version 25.1.0: Mon Oct 20 19:32:56 PDT 2025; root:xnu-12377.41.6~2/RELEASE_ARM64_T8132",
+        "machine": "arm64"
+    },
+    "python": "3.10.20",
+    "integrity": {
+        "parsed": true,
+        "provided_missing": [],
+        "student_missing": [],
+        "forbidden_calls": []
+    },
+    "schema": 4,
+    "laps": [
+        {
+            "lane": "outer",
+            "reason": "lap complete",
+            "samples": 4916,
+            "stops_raised": 2,
+            "stops_total": 2,
+            "sim_seconds": 358.65,
+            "wall_seconds": 51.22
+        },
+        {
+            "lane": "inner",
+            "reason": "lap complete",
+            "samples": 5377,
+            "stops_raised": 2,
+            "stops_total": 2,
+            "sim_seconds": 419.95,
+            "wall_seconds": 54.03
+        }
+    ],
+    "manifest": {
+        "schema": 4,
+        "laps": [
+            {
+                "lane": "outer",
+                "reason": "lap complete",
+                "samples": 4916,
+                "stops_raised": 2,
+                "stops_total": 2,
+                "sim_seconds": 358.65,
+                "wall_seconds": 51.22
+            },
+            {
+                "lane": "inner",
+                "reason": "lap complete",
+                "samples": 5377,
+                "stops_raised": 2,
+                "stops_total": 2,
+                "sim_seconds": 419.95,
+                "wall_seconds": 54.03
+            }
+        ],
+        "integrity": {
+            "parsed": true,
+            "provided_missing": [],
+            "student_missing": [],
+            "forbidden_calls": []
+        },
+        "csv_name": "NV_Task2A_run.csv",
+        "csv_rows": 10293,
+        "csv_columns": [
+            "lane",
+            "t_sim",
+            "t_wall",
+            "x",
+            "y",
+            "speed",
+            "stop_flag"
+        ],
+        "csv_sha256": "ca11645fa8de9e809c279e1642e6c6aefc06e5e692e1fd3df9c87ef4ebc9fff7",
+        "stop_at": [
+            0.33,
+            0.66
+        ],
+        "stop_hold_s": 5.0,
+        "lap_close": 0.97,
+        "script_name": "task2a.py",
+        "script_sha256": "e31e03cb3588279ea186ecf2b2e4b798917f36733387bb0f046cfc355f7b5b74",
+        "team": null,
+        "host": "Aryans-MacBook-Air.local",
+        "os_info": {
+            "name": "Darwin",
+            "version": "Darwin Kernel Version 25.1.0: Mon Oct 20 19:32:56 PDT 2025; root:xnu-12377.41.6~2/RELEASE_ARM64_T8132",
+            "machine": "arm64"
+        },
+        "python": "3.10.20",
+        "started_at": "2026-10-25T18:50:10+00:00",
+        "finished_at": "2026-10-25T18:51:57+00:00",
+        "wall_seconds": 106.8,
+        "nonce": "caa7afc093bc4c00bd9e7b1976de73f6"
+    },
+    "hmac": "36628f74c45e0374149e0386f51052b63bf4bc0d4f5c3726e11a046a46b0e4e7",
+    "meta": {
+        "evaluation_time": 106.91906094551086
+    }
+}

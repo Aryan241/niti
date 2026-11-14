@@ -53,7 +53,8 @@ WHEEL_RADIUS  = 0.0213               # m, measured: 3.0 rad/s drives 6.4 cm/s
 
 # Camera (same sensor as 2A/2C): 640 x 480, 95 deg horizontal FOV, 30 deg down
 IMG_W, IMG_H  = 640, 480
-FOCAL_PX      = (IMG_W / 2) / np.tan(np.deg2rad(95.0) / 2)
+CAMERA_FOV_X  = np.deg2rad(95.0)
+FOCAL_PX      = (IMG_W / 2) / np.tan(CAMERA_FOV_X / 2)
 CAMERA_MATRIX = np.array([[FOCAL_PX, 0, IMG_W / 2],
                           [0, FOCAL_PX, IMG_H / 2],
                           [0, 0, 1]])
@@ -76,13 +77,12 @@ MARKER_CORNERS_3D = np.array([[-_HM, _HM, 0], [_HM, _HM, 0],
 ######################## RUN SETTINGS ########################
 SPEED_LIMIT   = 3.0                  # rad/s everywhere
 ZONE_LIMIT    = 1.2                  # rad/s between the two Speed 40 signs
-CRUISE        = 2.90                 # what we actually command (a margin below the limits)
-ZONE_CRUISE   = 1.19
-ZONE_ENTRY_RANGE = 0.32           # m, a Speed 40 sign this close counts as reached
-ZONE_NEAR_RANGE  = 0.65           # m, ...or seen this close and then out of view
+CRUISE        = SPEED_LIMIT          # use the permitted global cap outside the zone
+ZONE_CRUISE   = 1.20                 # exact task cap while the Speed 40 zone is active
+ZONE_NEAR_RANGE  = 0.65           # m, evidence that the current sign was approached
 
 HALT_SECONDS      = 5.0              # required stationary time (simulation time)
-HALT_MARGIN       = 0.8              # extra hold so the graded 5 s is never short
+HALT_MARGIN       = 0.25             # verified stationary interval supports 5.25 s total
 HOSPITAL_STOP_RANGE = 0.565          # m, sign ahead of the vehicle centre at the pickup point
 HALT_COAST          = 0.013          # m rolled after the stop command takes effect
 HALT_LAG_FRAMES     = 1.5            # frames of travel between capture and the stop command
@@ -350,7 +350,10 @@ def _ordered_box(points):
 
 
 def _rectified_white_mask(image, contour):
-    rectangle = _ordered_box(cv2.boxPoints(cv2.minAreaRect(contour)))
+    hull = cv2.convexHull(contour)
+    quad = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
+    rectangle = _ordered_box(quad.reshape(4, 2) if len(quad) == 4 else
+                             cv2.boxPoints(cv2.minAreaRect(contour)))
     destination = np.array([[0, 0], [63, 0], [63, 63], [0, 63]], dtype=np.float32)
     transform = cv2.getPerspectiveTransform(rectangle, destination)
     warped = cv2.warpPerspective(image, transform, (64, 64))
@@ -364,6 +367,20 @@ def _template_score(symbol, template):
     if float(symbol.std()) < 1e-6:
         return 0.0
     return float(cv2.matchTemplate(symbol, template, cv2.TM_CCOEFF_NORMED)[0, 0])
+
+
+def _symbol_glyph(mask):
+    '''Ignore the white sign border; require a substantial interior letter.'''
+    interior = mask[8:56, 8:56]
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(interior, 8)
+    if count < 2:
+        return None
+    index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x, y, width, height, area = stats[index]
+    if area < 0.06 * interior.size or width < 0.28 * interior.shape[1] or height < 0.55 * interior.shape[0]:
+        return None
+    glyph = np.where(labels[y:y + height, x:x + width] == index, 255, 0).astype(np.uint8)
+    return cv2.resize(glyph, (32, 40), interpolation=cv2.INTER_AREA)
 
 
 def _load_symbol_template(filename, fallback):
@@ -404,6 +421,8 @@ _HOSPITAL_TEMPLATE = _load_symbol_template("Hospital.png", [
     [0, 0, 1, 0, 0, 1, 0, 0],
     [0, 0, 0, 0, 0, 0, 0, 0],
 ])
+_PARKING_GLYPH = _symbol_glyph(_PARKING_TEMPLATE)
+_HOSPITAL_GLYPH = _symbol_glyph(_HOSPITAL_TEMPLATE)
 
 
 def detect_signs(image, hsv, red_parts, blue_parts):
@@ -443,20 +462,136 @@ def detect_signs(image, hsv, red_parts, blue_parts):
         x, y, width, height = component["bbox"]
         if component["pixel_area"] < 120 or component["solidity"] < 0.80:
             continue
-        if y < 1 or y >= image.shape[0] * 0.75:
+        if x <= 0 or x + width >= image.shape[1] or y < 1 or y >= image.shape[0] * 0.75:
             continue
         ratio = width / float(height or 1)
         if ratio < 0.55 or ratio > 1.45:
             continue
         symbol = _rectified_white_mask(image, component["contour"])
-        parking_score = _template_score(symbol, _PARKING_TEMPLATE)
-        hospital_score = _template_score(symbol, _HOSPITAL_TEMPLATE)
-        if parking_score < 0.045 and hospital_score < 0.075:
+        glyph = _symbol_glyph(symbol)
+        if glyph is None:
+            continue
+        # Raw masks preserve small/oblique letters; normalized glyphs also work
+        # with the built-in no-reference templates, whose border/font differs.
+        parking_score = max(_template_score(symbol, _PARKING_TEMPLATE),
+                            _template_score(glyph, _PARKING_GLYPH))
+        hospital_score = max(_template_score(symbol, _HOSPITAL_TEMPLATE),
+                             _template_score(glyph, _HOSPITAL_GLYPH))
+        if max(parking_score, hospital_score) < 0.35 or abs(parking_score - hospital_score) < 0.03:
             continue
         label = "Parking" if parking_score >= hospital_score else "Hospital"
         detections.append({"label": label, "area": int(round(component["area"])),
                            "bbox": component["bbox"]})
     return detections
+
+
+def _oblique_speed40_candidates(frame):
+    """Image-only fragmented-rim recognizer for the small oblique Speed40 face."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    red = _colour_mask(hsv, "red")
+    blue = _colour_mask(hsv, "blue") > 0
+    white = cv2.inRange(hsv, (0, 0, 130), (179, 105, 255)) > 0
+    dark = cv2.inRange(hsv, (0, 0, 0), (179, 255, 90)) > 0
+    labels = cv2.dilate(red, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17)))
+    count, ids, stats, _ = cv2.connectedComponentsWithStats(labels, 8)
+    found = []
+    for i in range(1, count):
+        x, y, w, h, _ = map(int, stats[i])
+        if w < 3 or h < 3 or w > 140 or h > 140:
+            continue
+        # The component bounds already include the rim's 8-pixel dilation.
+        # Keep fragment morphology local; all supported pixels remain inside
+        # these bounds, including components clipped by the image border.
+        roi = np.s_[y:y+h, x:x+w]
+        rim = (ids[roi] == i) & (red[roi] > 0)
+        near = cv2.dilate(rim.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))) > 0
+        local_support = (rim | (near & white[roi]) | (near & dark[roi])) & ~blue[roi]
+        yy, xx = np.where(local_support)
+        if len(xx) < 12 or int(rim.sum()) < 3:
+            continue
+        points = np.column_stack((xx+x, yy+y)).astype(np.float32)
+        support = np.zeros(red.shape, np.uint8)
+        support[roi] = local_support
+        rect = cv2.minAreaRect(points)
+        box = cv2.boxPoints(rect)
+        center = box.mean(axis=0)
+        box = box[np.argsort(np.arctan2(box[:, 1]-center[1], box[:, 0]-center[0]))].astype(np.float32)
+        dst = np.array([[0, 0], [63, 0], [63, 63], [0, 63]], np.float32)
+        patch = cv2.warpPerspective(frame, cv2.getPerspectiveTransform(box, dst), (64, 64), flags=cv2.INTER_NEAREST)
+        sm = cv2.warpPerspective(support.astype(np.uint8), cv2.getPerspectiveTransform(box, dst), (64, 64), flags=cv2.INTER_NEAREST) > 0
+        ph = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        pb = ((ph[:, :, 0] >= 85) & (ph[:, :, 0] <= 145) & (ph[:, :, 1] >= 60) & (ph[:, :, 2] >= 30))
+        pr = (((ph[:, :, 0] <= 14) | (ph[:, :, 0] >= 166)) & (ph[:, :, 1] >= 80) & (ph[:, :, 2] >= 50) & sm & ~pb)
+        pw = (ph[:, :, 1] <= 105) & (ph[:, :, 2] >= 130) & sm & ~pb
+        pd = (ph[:, :, 2] <= 90) & sm & ~pb & ~pr
+        ry, rx = np.where(pr)
+        if len(rx) < 5:
+            continue
+        (cx, cy), (d1, d2), angle = cv2.fitEllipse(np.column_stack((rx, ry)).astype(np.float32).reshape(-1, 1, 2))
+        # Keep each fitted radius paired with OpenCV's returned angle basis.
+        # Sorting the radii without rotating the basis corrupts ellipse tests.
+        a, b = d1/2.0, d2/2.0
+        theta = np.deg2rad(angle); dx=rx-cx; dy=ry-cy
+        u=dx*np.cos(theta)+dy*np.sin(theta); v=-dx*np.sin(theta)+dy*np.cos(theta)
+        radial=np.sqrt((u/max(a, 1e-3))**2+(v/max(b, 1e-3))**2)
+        ang=np.sort(np.mod(np.arctan2(v/max(b, 1e-3), u/max(a, 1e-3)), 2*np.pi))
+        coverage=1.0-float(np.diff(np.r_[ang, ang[0]+2*np.pi]).max()/(2*np.pi))
+        yy0, xx0 = np.indices(pd.shape); du=xx0-cx; dv=yy0-cy
+        iu=du*np.cos(theta)+dv*np.sin(theta); iv=-du*np.sin(theta)+dv*np.cos(theta)
+        interior=(np.sqrt((iu/max(a, 1e-3))**2+(iv/max(b, 1e-3))**2)<.9)
+        white_inside=float(np.mean(interior[pw])) if np.any(pw) else 0.0
+        n, _, st, _ = cv2.connectedComponentsWithStats((interior & pd).astype(np.uint8), 8)
+        glyph_parts=sum(int(st[j, cv2.CC_STAT_AREA]) >= 3 for j in range(1, n))
+        ratio=min(a, b)/max(max(a, b), 1e-3); mad=float(np.median(np.abs(radial-1)))
+        interior_white = int(np.count_nonzero(interior & pw))
+        interior_dark = int(np.count_nonzero(interior & pd))
+        white_fill = interior_white / max(1, interior_white + interior_dark)
+        white_support = float(np.count_nonzero(pw)) / max(1, np.count_nonzero(sm))
+        if (.28 <= ratio <= .55 and mad <= .10 and white_support >= .25 and
+                .70 <= white_fill <= .92 and glyph_parts >= 4 and coverage >= .60):
+            bx, by, bw, bh = cv2.boundingRect(points.astype(np.int32))
+            found.append({"label": "Speed40", "area": int(len(rx)), "bbox": (bx, by, bw, bh),
+                          # Partial rim views support a track, but cannot release
+                          # the cap without a stronger current face observation.
+                          "strong": white_inside >= .25 and coverage >= .80})
+    return found
+
+
+def _whiteboard_speed_candidates(hsv):
+    # Kept as a conservative compatibility shim; callers must provide the image.
+    return []
+
+
+class WeakBoardTracker:
+    '''Require two spatially consistent weak board observations in a row.'''
+
+    def __init__(self):
+        self.bbox = None
+        self.streak = 0
+
+    def reset(self):
+        self.bbox = None
+        self.streak = 0
+
+    def update(self, candidates):
+        if len(candidates) != 1:
+            self.reset()
+            return []
+        candidate = candidates[0]
+        x, y, width, height = candidate['bbox']
+        if self.bbox is not None:
+            px, py, pwidth, pheight = self.bbox
+            cx, cy = x + width / 2.0, y + height / 2.0
+            pcx, pcy = px + pwidth / 2.0, py + pheight / 2.0
+            displacement = np.hypot(cx - pcx, cy - pcy)
+            size_ratio = height / float(pheight or 1)
+            consistent = (displacement <= max(18.0, 1.5 * max(height, pheight)) and
+                          0.5 <= size_ratio <= 2.0)
+            if not consistent:
+                self.streak = 0
+        self.streak += 1
+        self.bbox = candidate['bbox']
+        return [candidate] if self.streak >= 2 and candidate.get('strong', True) else []
 
 
 def detect_obstacles(hsv, red_mask):
@@ -550,7 +685,7 @@ def lane_control(lane, speed_cap, steer_cap=None):
     virtual = -2.05 * near_error - 1.35 * (far_error - near_error)
     virtual = float(np.clip(virtual, -limit, limit))
     turn = min(abs(virtual) / _virtual_steering_limit(), 1.0)
-    speed = speed_cap * (1.0 - 0.15 * turn) if speed_cap > ZONE_LIMIT else speed_cap
+    speed = speed_cap * (1.0 - 0.05 * turn) if speed_cap > ZONE_LIMIT else speed_cap
     return virtual, float(min(speed, speed_cap))
 
 
@@ -561,13 +696,28 @@ def lane_control(lane, speed_cap, steer_cap=None):
 class PoseEstimator:
     '''Vehicle pose relative to the bay from the ArUco marker (2C).'''
 
-    YAW_BLEND = 0.12
+    YAW_NORMAL_TAU = 0.20             # seconds; normal clear-yaw correction time constant
     YAW_GATE = np.deg2rad(15.0)
     AMBIGUITY_RATIO = 1.5
+    YAW_RECOVERY_FRAMES = 3
+    # Bound frame-to-frame yaw changes by the greatest steering yaw rate the
+    # vehicle can command, with a small image/PnP noise allowance.
+    YAW_RECOVERY_RATE = ((SPEED_LIMIT - 0.05) * WHEEL_RADIUS *
+                         np.tan(_virtual_steering_limit()) / WHEELBASE)
+    YAW_RECOVERY_FLOOR = np.deg2rad(2.0)
+    YAW_RECOVERY_MAX_GAP = 0.75
+    YAW_RECOVERY_BLEND = 0.60
 
     def __init__(self):
         self.heading = 0.0
         self.rho = None
+        self._recovery_yaw = None
+        self._recovery_count = 0
+        self._last_observation_time = None
+
+    def _reset_yaw_recovery(self):
+        self._recovery_yaw = None
+        self._recovery_count = 0
 
     @staticmethod
     def _bearing(corners):
@@ -577,65 +727,340 @@ class PoseEstimator:
         return float(np.arctan2(xc, np.cos(CAM_PITCH) + yc * np.sin(CAM_PITCH)))
 
     def _pnp(self, corners):
-        _, rvecs, tvecs, errs = cv2.solvePnPGeneric(
+        count, rvecs, tvecs, errs = cv2.solvePnPGeneric(
             MARKER_CORNERS_3D, corners.astype(np.float32), CAMERA_MATRIX,
             np.zeros(5), flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        if not count or errs is None:
+            return None
         sols = []
         for rv, tv, e in zip(rvecs, tvecs, np.array(errs).flatten()):
+            rv, tv = np.asarray(rv), np.asarray(tv).reshape(-1)
+            if (rv.size != 3 or tv.size != 3 or not np.isfinite(rv).all() or
+                    not np.isfinite(tv).all() or not np.isfinite(e) or e < 0 or
+                    tv[2] <= 0 or tv @ tv <= CAM_ABOVE_MK ** 2):
+                continue
             R, _ = cv2.Rodrigues(rv)
             fwd = R.T @ np.array([0.0, 0.0, 1.0])
-            sols.append((float(e), float(np.arctan2(fwd[0], -fwd[2])), tv.flatten()))
+            sols.append((float(e), float(np.arctan2(fwd[0], -fwd[2])), tv))
+        if not sols:
+            return None
         sols.sort(key=lambda s: s[0])
         t = sols[0][2]
         rho = float(np.sqrt(max(t @ t - CAM_ABOVE_MK ** 2, 1e-6)))
         clear = len(sols) < 2 or sols[1][0] > self.AMBIGUITY_RATIO * max(sols[0][0], 1e-6)
         return (sols[0][1] if clear else None), rho
 
-    def update(self, corners, last_steering):
+    def update(self, corners, last_steering, now=None, last_speed=0.0):
+        # Keep image-fusion timing separate from motion-prediction timing. The
+        # fallback interval preserves the existing blend behavior, but cannot
+        # invent travel when this observation has no valid elapsed time.
+        blend_dt = 0.15
+        prediction_dt = 0.0
+        try:
+            observation_time = None if now is None else float(now)
+        except (TypeError, ValueError, OverflowError):
+            observation_time = None
+        if now is None:
+            self._reset_yaw_recovery()
+            self._last_observation_time = None
+        elif observation_time is None or not np.isfinite(observation_time):
+            self._reset_yaw_recovery()
+            self._last_observation_time = None
+        elif self._last_observation_time is None:
+            self._last_observation_time = observation_time
+        else:
+            elapsed = observation_time - float(self._last_observation_time)
+            self._last_observation_time = observation_time
+            if 0.0 < elapsed <= self.YAW_RECOVERY_MAX_GAP:
+                blend_dt = elapsed
+                prediction_dt = elapsed
+            else:
+                self._reset_yaw_recovery()
+
+        try:
+            bounded_speed = float(last_speed)
+        except (TypeError, ValueError, OverflowError):
+            bounded_speed = 0.0
+        if not np.isfinite(bounded_speed):
+            bounded_speed = 0.0
+        bounded_speed = float(np.clip(bounded_speed, 0.0, SPEED_LIMIT))
+        try:
+            bounded_steering = float(last_steering)
+        except (TypeError, ValueError, OverflowError):
+            bounded_steering = 0.0
+        if not np.isfinite(bounded_steering):
+            bounded_steering = 0.0
+        bounded_steering = float(np.clip(bounded_steering, -_virtual_steering_limit(),
+                                         _virtual_steering_limit()))
+        if prediction_dt > 0.0:
+            distance = bounded_speed * WHEEL_RADIUS * prediction_dt
+            self.heading -= (np.tan(bounded_steering) * distance / WHEELBASE)
+
         if corners is None:
+            self._reset_yaw_recovery()
+            return None
+        try:
+            corners = np.asarray(corners, dtype=np.float32)
+            if (corners.shape != (4, 2) or not np.isfinite(corners).all() or
+                    not np.isfinite(last_steering) or
+                    not cv2.isContourConvex(corners) or abs(cv2.contourArea(corners)) < 1.0):
+                self._reset_yaw_recovery()
+                return None
+            solution = self._pnp(corners)
+        except (cv2.error, ValueError, TypeError, OverflowError):
+            self._reset_yaw_recovery()
+            return None
+        if solution is None:
+            self._reset_yaw_recovery()
             return None
         bearing = self._bearing(corners)
-        yaw_seen, rho_now = self._pnp(corners)
+        yaw_seen, rho_now = solution
         if self.rho is None:
             self.rho = rho_now
-        rho_prev, self.rho = self.rho, 0.6 * self.rho + 0.4 * rho_now
-        ds = min(max((rho_prev - self.rho) / max(np.cos(bearing), 0.3), 0.0), 0.01)
-        self.heading -= np.tan(last_steering) / WHEELBASE * ds
-        if yaw_seen is not None and abs(yaw_seen - self.heading) < self.YAW_GATE:
-            self.heading += self.YAW_BLEND * (yaw_seen - self.heading)
+        self.rho = 0.6 * self.rho + 0.4 * rho_now
+        range_filter_lag = max(self.rho - rho_now, 0.0)
+        # Filtered range is diagnostic only; yaw prediction integrates the
+        # preceding bounded motor/steering command over valid simulation time.
+        heading_observed = False
+        if yaw_seen is None:
+            # IPPE ambiguity is not evidence for either alignment or recovery.
+            self._reset_yaw_recovery()
+        else:
+            yaw_residual = float(np.arctan2(np.sin(yaw_seen - self.heading),
+                                            np.cos(yaw_seen - self.heading)))
+            if abs(yaw_residual) < self.YAW_GATE:
+                self._reset_yaw_recovery()
+                normal_blend = 1.0 - np.exp(-blend_dt / self.YAW_NORMAL_TAU)
+                self.heading += normal_blend * yaw_residual
+                heading_observed = True
+            else:
+                if self._recovery_yaw is None:
+                    self._recovery_yaw, self._recovery_count = yaw_seen, 1
+                else:
+                    yaw_step = abs(float(np.arctan2(
+                        np.sin(yaw_seen - self._recovery_yaw),
+                        np.cos(yaw_seen - self._recovery_yaw))))
+                    plausible_step = (self.YAW_RECOVERY_FLOOR +
+                                      self.YAW_RECOVERY_RATE * blend_dt)
+                    if yaw_step <= plausible_step:
+                        self._recovery_count += 1
+                        self._recovery_yaw = yaw_seen
+                    else:
+                        self._recovery_yaw, self._recovery_count = yaw_seen, 1
+                if self._recovery_count >= self.YAW_RECOVERY_FRAMES:
+                    self.heading += self.YAW_RECOVERY_BLEND * yaw_residual
+                    heading_observed = abs(float(np.arctan2(
+                        np.sin(yaw_seen - self.heading),
+                        np.cos(yaw_seen - self.heading)))) < self.YAW_GATE
         los = bearing + self.heading
-        lateral_cam = -self.rho * np.sin(los)
-        forward_cam = self.rho * np.cos(los)
+        # Current-frame raw range pairs with current-frame bearing. Keep the
+        # filtered range only for odometry; do not let its lag certify parking.
+        lateral_cam = -rho_now * np.sin(los)
+        forward_cam = rho_now * np.cos(los)
         lateral_front = lateral_cam + (WHEELBASE / 2 - CAM_AHEAD) * np.sin(self.heading)
         forward = forward_cam + CAM_AHEAD * np.cos(self.heading)
         return {'lateral': float(-lateral_front), 'heading': float(-self.heading),
-                'forward': float(forward), 'bearing': float(-bearing)}
+                'forward': float(forward), 'bearing': float(-bearing),
+                'range_filter_lag': float(range_filter_lag),
+                # A zero-initialized/propagated yaw is not proof of alignment.
+                'heading_observed': bool(heading_observed)}
+
+
+def valid_pose(pose):
+    '''Validate the required scalar pose fields before any motion or success.'''
+    if not isinstance(pose, dict):
+        return False
+    try:
+        values = [pose[k] for k in ('lateral', 'heading', 'forward', 'bearing')]
+        return (all(np.isscalar(v) and np.isfinite(v) for v in values) and
+                pose['forward'] > 0 and abs(pose['heading']) <= np.pi and
+                abs(pose['bearing']) <= np.pi / 2)
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 class Parker:
     '''
     The 2C parking manoeuvre, adapted to a bay that opens off the side of the
-    road. The lane position at hand-over is held until the bay is alongside
-    (MERGE_START), then a smootherstep path brings the vehicle onto the bay's
-    centre line by MERGE_END, so the wheels never cut the corner of the bay.
+    road. A smootherstep path begins at the measured hand-over pose and brings
+    the vehicle onto the bay centre line by MERGE_END.
     Then straight on to the spot and stop.
-    If the marker drops out of view near the end, the remaining distance is
-    dead-reckoned from the commanded wheel speed. Returns (steering, speed, parked).
+    Marker loss commands an immediate stop; command integration is diagnostic
+    only and never establishes parking success. Returns (steering, speed, parked).
     '''
 
-    MERGE_START = 0.78                   # hold the lane until the bay is alongside
     MERGE_END = 0.26
+    # MERGE_END is defined in the existing center-forward frame. The aligned
+    # rear axle reaches that plane when the vehicle center is L/2 behind it.
+    MERGE_END_REAR = MERGE_END + WHEELBASE / 2.0
+    FORWARD_TOLERANCE = 0.015
+    LATERAL_TOLERANCE = 0.025
+    HEADING_TOLERANCE = np.deg2rad(5.0)
+    # Offline marker-frame comparisons from three Hard parks show image
+    # centre-forward under-reporting of 7.74–8.48 mm. Use the conservative
+    # observed edge only in terminal camera-pose checks. Lateral and heading
+    # residual signs changed across runs, so those checks use symmetric
+    # completion margins instead of a signed correction. These are generic
+    # camera-pose calibration values, never simulator/world coordinates.
+    IMAGE_FORWARD_BIAS = 0.0083
+    # Keep completion comfortably inside the unchanged physical tolerances.
+    COMPLETION_FORWARD_TOLERANCE = 0.010
+    COMPLETION_LATERAL_TOLERANCE = 0.015
+    COMPLETION_HEADING_TOLERANCE = np.deg2rad(3.5)
+    SETTLE_SECONDS = 0.5
+    MAX_SPEED = SPEED_LIMIT - 0.05
+    MAX_FRAME_TRAVEL = 0.016          # m; bound motion between camera observations
+    MAX_YAW_RATE = 0.30               # rad/s; conservative cap retained after the 0.38 trial
+    BRAKING_DECEL = 0.020              # m/s^2; conservative approach model
+    BRAKING_MARGIN = 0.005             # m before the desired 0.20 m stopping point
+    EDGE_BEARING_MARGIN = np.deg2rad(8.0)
+    UNCERTAIN_EDGE_STOP_MARGIN = np.deg2rad(15.0)
+    TRACK_LATERAL_SCALE = 0.060        # m; scale from live safe-run error distribution
+    TRACK_HEADING_SCALE = 0.20         # rad
+    CUBIC_BEARING_RESERVE = np.deg2rad(5.0)
+    CUBIC_CURVATURE_RESERVE = 0.90
 
     def __init__(self):
         self.last_pose = None
         self.last_steering = 0.0
-        self.last_speed = 0.6
+        self.last_speed = 0.0
         self.last_time = None
         self.est_forward = None
         self.misses = 0
         self.good_frames = 0
-        self.start_lateral = None
-        self.start_forward = None
+        self.start_rear_lateral = None
+        self.start_rear_forward = None
+        self.path_profile = None
+        self.merge_end_rear = self.MERGE_END_REAR
+        self.rest_time = None
+        self.failed = False
+
+    @classmethod
+    def _completion_pose(cls, pose):
+        """Convert image pose to calibrated bay-center/front-axle coordinates."""
+        heading = float(np.arctan2(np.sin(pose['heading']), np.cos(pose['heading'])))
+        return dict(forward=float(pose['forward'] + cls.IMAGE_FORWARD_BIAS),
+                    lateral=float(pose['lateral']),
+                    heading=heading)
+
+    @staticmethod
+    def _rear_coordinates(pose):
+        """Convert bay-relative front/center pose to rear-axle coordinates."""
+        lateral = float(pose['lateral']) - WHEELBASE * np.sin(pose['heading'])
+        forward = float(pose['forward']) + (WHEELBASE / 2.0) * np.cos(pose['heading'])
+        return lateral, forward
+
+    def invalidate(self):
+        self.good_frames = 0
+        self.rest_time = None
+        self.last_pose = None
+        self.last_steering = self.last_speed = 0.0
+
+    def _path_reference(self, rear_forward):
+        # The quintic's hand-off, progress and cross-track error all use the
+        # rear axle. Translate the aligned endpoint from the established
+        # center-forward MERGE_END convention exactly once.
+        span = max(self.start_rear_forward - self.merge_end_rear, 0.30)
+        raw = (rear_forward - self.merge_end_rear) / span
+        r = float(np.clip(raw, 0.0, 1.0))
+        if self.path_profile is None:
+            samples = np.linspace(0.0, 1.0, 201)
+            y0 = float(self.start_rear_lateral)
+            cubic_slope = y0 * (6 * samples - 6 * samples ** 2) / span
+            cubic_second = y0 * (6 - 12 * samples) / span ** 2
+            cubic_curvature = cubic_second / (1.0 + cubic_slope ** 2) ** 1.5
+            cubic_theta = -np.arctan(cubic_slope)
+            x = self.MERGE_END_REAR + span * samples
+            camera_x = x - (WHEELBASE / 2.0 + CAM_AHEAD) * np.cos(cubic_theta)
+            camera_y = y0 * (3 * samples ** 2 - 2 * samples ** 3) + (
+                WHEELBASE / 2.0 + CAM_AHEAD) * np.sin(cubic_theta)
+            cubic_bearing = np.arctan2(-camera_y, camera_x) - cubic_theta
+            quintic_slope = y0 * (30 * samples ** 4 - 60 * samples ** 3 +
+                                   30 * samples ** 2) / span
+            quintic_theta = -np.arctan(quintic_slope)
+            quintic_y = y0 * (6 * samples ** 5 - 15 * samples ** 4 + 10 * samples ** 3)
+            quintic_bearing = np.arctan2(
+                -(quintic_y + (WHEELBASE / 2.0 + CAM_AHEAD) * np.sin(quintic_theta)),
+                x - (WHEELBASE / 2.0 + CAM_AHEAD) * np.cos(quintic_theta)) - quintic_theta
+            bearing_limit = (CAMERA_FOV_X / 2.0 - self.UNCERTAIN_EDGE_STOP_MARGIN -
+                             self.CUBIC_BEARING_RESERVE)
+            curvature_limit = (np.tan(_virtual_steering_limit()) / WHEELBASE *
+                               self.CUBIC_CURVATURE_RESERVE)
+            peak_bearing = float(np.max(np.abs(cubic_bearing)))
+            peak_quintic_bearing = float(np.max(np.abs(quintic_bearing)))
+            useful_bearing_reduction = peak_quintic_bearing - peak_bearing >= np.deg2rad(3.0)
+            feasible = (np.max(np.abs(cubic_curvature)) <= curvature_limit and
+                        peak_bearing <= bearing_limit and useful_bearing_reduction)
+            # A shorter remaining merge can make the cubic just miss its
+            # visibility reserve while the quintic is substantially worse.
+            # Extend only the planned merge, leaving 2 cm of aligned travel
+            # before the bay center. Keep the same curvature/bearing reserves.
+            if not feasible and useful_bearing_reduction:
+                endpoint = BAY_MIDDLE_FORWARD + WHEELBASE / 2.0 + 0.02
+                extended_span = self.start_rear_forward - endpoint
+                if extended_span > span:
+                    es = y0 * (6*samples - 6*samples**2) / extended_span
+                    ec = y0 * (6 - 12*samples) / extended_span**2 / (1+es**2)**1.5
+                    et = -np.arctan(es)
+                    ex = endpoint + extended_span*samples
+                    ey = y0 * (3*samples**2 - 2*samples**3)
+                    offset = WHEELBASE / 2.0 + CAM_AHEAD
+                    eb = np.arctan2(-(ey + offset*np.sin(et)),
+                                    ex - offset*np.cos(et)) - et
+                    if (np.max(np.abs(ec)) <= curvature_limit and
+                            np.max(np.abs(eb)) <= bearing_limit):
+                        self.merge_end_rear = endpoint
+                        span = extended_span
+                        raw = (rear_forward - endpoint) / span
+                        r = float(np.clip(raw, 0.0, 1.0))
+                        feasible = True
+            self.path_profile = 'cubic' if feasible else 'quintic'
+        if self.path_profile == 'cubic':
+            lateral = self.start_rear_lateral * (3 * r ** 2 - 2 * r ** 3)
+            if not 0.0 < raw < 1.0:
+                return lateral, 0.0, 0.0
+            slope = self.start_rear_lateral * (6 * r - 6 * r ** 2) / span
+            second = self.start_rear_lateral * (6 - 12 * r) / (span * span)
+            return lateral, slope, second / (1.0 + slope * slope) ** 1.5
+        lateral = self.start_rear_lateral * (6 * r ** 5 - 15 * r ** 4 + 10 * r ** 3)
+        if not 0.0 < raw < 1.0:
+            return lateral, 0.0, 0.0
+        slope = self.start_rear_lateral * (30 * r ** 4 - 60 * r ** 3 + 30 * r ** 2) / span
+        second = self.start_rear_lateral * (120 * r ** 3 - 180 * r ** 2 + 60 * r) / (span * span)
+        return lateral, slope, second / (1.0 + slope * slope) ** 1.5
+
+    def _adaptive_speed(self, pose, steering, dt, lateral_error, heading_error,
+                        lateral_ref, heading_ref):
+        """Bound parking speed using observed tracking, timing and stopping room."""
+        speed = self.MAX_SPEED
+        if dt > 0.0:
+            speed = min(speed, self.MAX_FRAME_TRAVEL / (WHEEL_RADIUS * dt))
+        remaining = max(pose['forward'] - BAY_MIDDLE_FORWARD - self.BRAKING_MARGIN, 0.0)
+        # forward is reconstructed from this frame's raw marker range, so the
+        # filtered odometry range lag must not be counted as extra stopping delay.
+        response_lag = max(float(dt), 0.0)
+        limited_linear_speed = self.BRAKING_DECEL * (
+            np.sqrt(response_lag ** 2 + 2.0 * remaining / self.BRAKING_DECEL) -
+            response_lag)
+        speed = min(speed, limited_linear_speed / WHEEL_RADIUS)
+        turn = abs(np.tan(steering)) / WHEELBASE
+        if turn > 1e-9:
+            speed = min(speed, self.MAX_YAW_RATE / (WHEEL_RADIUS * turn))
+        bearing_margin = CAMERA_FOV_X / 2.0 - abs(float(pose['bearing']))
+        if (not pose.get('heading_observed', False) and
+                bearing_margin < self.UNCERTAIN_EDGE_STOP_MARGIN):
+            return 0.0
+        if (not pose.get('heading_observed', False) or
+                bearing_margin < max(self.EDGE_BEARING_MARGIN,
+                                     self.UNCERTAIN_EDGE_STOP_MARGIN)):
+            speed = min(speed, ZONE_CRUISE)
+        lat_error = abs(lateral_error - lateral_ref)
+        yaw_error = abs(heading_error - heading_ref)
+        normalized_error = max(lat_error / self.TRACK_LATERAL_SCALE,
+                               yaw_error / self.TRACK_HEADING_SCALE)
+        tracking_factor = float(np.clip(1.0 - 0.55 * max(normalized_error - 0.5, 0.0),
+                                        0.40, 1.0))
+        return float(max(0.0, speed * tracking_factor))
 
     def step(self, pose, now):
         limit = _virtual_steering_limit()
@@ -644,75 +1069,96 @@ class Parker:
         if self.est_forward is not None:
             self.est_forward -= self.last_speed * WHEEL_RADIUS * dt
 
-        if pose is None or not np.all(np.isfinite(list(pose.values()))):
+        if self.failed or not valid_pose(pose):
             self.misses += 1
-            if self.last_pose is None:
-                return 0.0, 0.3, False
-            if self.good_frames >= 3:
-                return 0.0, 0.0, True
-            if self.est_forward is not None and self.est_forward < self.MERGE_END + 0.12:
-                # Close in and the marker is out of view: straight on, by odometry.
-                if self.est_forward <= BAY_MIDDLE_FORWARD:
-                    return 0.0, 0.0, True
-                self.last_steering = 0.0
-                self.last_speed = float(np.clip(14.0 * (self.est_forward - BAY_MIDDLE_FORWARD), 0.25, 0.6))
-                return 0.0, self.last_speed, False
-            steering = self.last_steering * (0.97 ** min(self.misses, 30))
-            self.last_speed = 0.3 if self.misses < 60 else 0.0
-            self.last_steering = steering
-            return float(np.clip(steering, -limit, limit)), self.last_speed, False
+            self.invalidate()
+            return 0.0, 0.0, False
 
         lateral, heading = pose["lateral"], pose["heading"]
         forward, bearing = pose["forward"], pose["bearing"]
+        rear_lateral, rear_forward = self._rear_coordinates(pose)
         self.misses = 0
-        self.last_pose = pose
+        previous_pose = self.last_pose
+        self.last_pose = pose.copy()
         self.est_forward = forward
-        if self.start_lateral is None:
-            self.start_lateral, self.start_forward = lateral, forward
+        if self.start_rear_lateral is None:
+            self.start_rear_lateral = rear_lateral
+            self.start_rear_forward = rear_forward
 
-        # From the outer lane the shift is twice as long, so it uses the whole approach.
-        merge_start = self.MERGE_START if self.start_lateral <= PARK_INNER_LATERAL else self.start_forward
-        span = max(min(self.start_forward, merge_start) - self.MERGE_END, 0.30)
-        r = float(np.clip((forward - self.MERGE_END) / span, 0.0, 1.0))
-        lateral_ref = self.start_lateral * (6 * r ** 5 - 15 * r ** 4 + 10 * r ** 3)
-        slope = self.start_lateral * (30 * r ** 4 - 60 * r ** 3 + 30 * r ** 2) / span
+        lateral_ref, slope, curvature = self._path_reference(rear_forward)
         heading_ref = -float(np.arctan(slope))
-        second = self.start_lateral * (120 * r ** 3 - 180 * r ** 2 + 60 * r) / (span * span)
-        curvature = second / (1.0 + slope * slope) ** 1.5
 
-        lateral_error = float(lateral - WHEELBASE * np.sin(heading))
+        lateral_error = rear_lateral
         heading_error = float(np.clip(heading, -np.pi / 2.0, np.pi / 2.0))
-        lateral_gain = 30.0 if forward < self.MERGE_END else 7.0
-        heading_gain = 4.0 if forward < self.MERGE_END else 2.8
+        lateral_gain = 30.0 if rear_forward < self.merge_end_rear else 7.0
+        heading_gain = 8.0 if rear_forward < self.merge_end_rear else 2.8
         steering = (float(np.arctan(WHEELBASE * curvature)) +
                     heading_gain * (heading_ref - heading_error) -
                     lateral_gain * (lateral_error - lateral_ref))
-        if heading_error < -0.65:
-            steering = max(steering, 3.0 * (-0.65 - heading_error))
-        elif heading_error > 0.65:
-            steering = min(steering, 3.0 * (0.65 - heading_error))
-        if bearing > 0.55:
-            steering = max(steering, 3.0 * (bearing - 0.55))
-        elif bearing < -0.55:
-            steering = min(steering, 3.0 * (bearing + 0.55))
+        # Permit the path's planned heading on either merge. Keep the separate
+        # marker-bearing guard below to limit turns that move the target out of view.
+        heading_limit = max(0.65, abs(heading_ref))
+        if heading_error < -heading_limit:
+            steering = max(steering, 3.0 * (-heading_limit - heading_error))
+        elif heading_error > heading_limit:
+            steering = min(steering, 3.0 * (heading_limit - heading_error))
+        if bearing > 0.65:
+            steering = max(steering, 3.0 * (bearing - 0.65))
+        elif bearing < -0.65:
+            steering = min(steering, 3.0 * (bearing + 0.65))
         steering = float(np.clip(steering, -limit, limit))
 
-        # The vehicle cannot reverse, so reaching the spot's distance ends the manoeuvre.
-        at_target = forward <= BAY_MIDDLE_FORWARD + 0.015
-        self.good_frames = self.good_frames + 1 if at_target else 0
-        if self.good_frames >= 2 or forward < BAY_MIDDLE_FORWARD - 0.02:
-            self.last_speed = 0.0
-            return 0.0, 0.0, True
+        completion = self._completion_pose(pose)
+        check_forward = completion['forward']
+        check_lateral = completion['lateral']
+        check_heading = completion['heading']
+        at_target = check_forward <= BAY_MIDDLE_FORWARD + self.FORWARD_TOLERANCE
         if at_target:
+            aligned = (abs(check_forward - BAY_MIDDLE_FORWARD) <=
+                       self.COMPLETION_FORWARD_TOLERANCE and
+                       abs(check_lateral) <= self.COMPLETION_LATERAL_TOLERANCE and
+                       abs(check_heading) <= self.COMPLETION_HEADING_TOLERANCE)
+            if not aligned:
+                # The front edge of the acceptance window is not an overshoot.
+                # Use remaining physical-window distance for a slow correction
+                # only when steering authority and lateral clearance support it.
+                remaining = check_forward - (BAY_MIDDLE_FORWARD - self.FORWARD_TOLERANCE)
+                max_curvature = np.tan(limit) / WHEELBASE
+                needed = max(abs(check_heading) - self.COMPLETION_HEADING_TOLERANCE,
+                             0.0) / max_curvature
+                safe = (remaining > 0 and needed < remaining and
+                        abs(check_lateral) + needed * abs(np.sin(check_heading)) <=
+                        self.LATERAL_TOLERANCE)
+                self.good_frames = 0
+                self.rest_time = None
+                if safe:
+                    steering = float(np.clip(-4.0 * check_heading - 7.0 * check_lateral,
+                                             -limit, limit))
+                    speed = min(0.25, 14.0 * remaining)
+                    self.last_steering, self.last_speed = steering, speed
+                    return steering, speed, False
+                # No reverse recovery is implemented. Never label an overshoot as parked.
+                self.failed = True
+            still = (aligned and pose.get('heading_observed', True) and
+                     self.last_speed == 0.0 and previous_pose is not None and
+                     abs(forward - previous_pose['forward']) <= 0.003 and
+                     abs(lateral - previous_pose['lateral']) <= 0.003 and
+                     abs(heading - previous_pose['heading']) <= np.deg2rad(2.0))
+            self.good_frames = self.good_frames + 1 if still else 0
+            if not still:
+                self.rest_time = None
+            elif self.rest_time is None:
+                self.rest_time = now
             self.last_steering, self.last_speed = 0.0, 0.0
-            return 0.0, 0.0, False
+            parked = (self.good_frames >= 3 and self.rest_time is not None and
+                      now - self.rest_time >= self.SETTLE_SECONDS)
+            return 0.0, 0.0, parked
 
-        if forward > self.MERGE_START:
-            speed = 2.2
-        else:
-            speed = float(np.clip(14.0 * (forward - BAY_MIDDLE_FORWARD), 0.25, 1.19))
-        if abs(steering) > 0.80 * limit:
-            speed = min(speed, 0.65)
+        self.good_frames = 0
+        self.rest_time = None
+
+        speed = self._adaptive_speed(pose, steering, dt, lateral_error,
+                                     heading_error, lateral_ref, heading_ref)
         self.last_steering, self.last_speed = steering, float(speed)
         return steering, float(speed), False
 
@@ -722,50 +1168,53 @@ class Parker:
 # ============================================================
 
 class SignTracker:
-    '''Turns per-frame detections of one sign label into one event per sign.
-    A sign counts as reached once it is seen within `max_range` for a few
-    frames - or, when it sits far enough to the side that it leaves the
-    camera's view first, once it has been seen within `near_range` and then
-    drops out of sight. The next sign of the label counts only after this one
-    has been out of sight for `gap_seconds`.'''
+    '''Enter on first sight; release only after a distinct subsequent encounter.
 
-    def __init__(self, max_range, near_range, frames_needed=2, gap_seconds=3.0, lost_seconds=0.4):
-        self.max_range = max_range
+    Require a near approach, sustained absence with commanded travel, and a
+    new farther-away sign confirmed in consecutive frames. Absence alone, or
+    reacquiring the same near sign, never releases the conservative zone cap.
+    Commanded travel is supporting evidence, not measured vehicle motion.
+    '''
+
+    def __init__(self, near_range, frames_needed=2, gap_seconds=4.0):
         self.near_range = near_range
         self.frames_needed = frames_needed
         self.gap_seconds = gap_seconds
-        self.lost_seconds = lost_seconds
         self.streak = 0
-        self.near_streak = 0
         self.last_seen = -1e9
-        self.active = False              # current sign already counted
-        self.closing = False             # current sign seen near, not yet counted
+        self.nearest = float('inf')
+        self.unseen_travel = 0.0
+        self.rearmed = False
         self.count = 0
 
-    def update(self, detections, now, frame_dt=0.0):
-        '''Returns True on the frame a new sign is confirmed. A single missed
-        detection is not "out of view": lost means unseen for a few frames.'''
+    def update(self, detections, now, frame_dt=0.0, travel=0.0, confirmed=True):
         ranges = [estimate_sign_range(d["bbox"])[0] for d in detections]
-        if ranges:
-            self.last_seen = now
+        ranges = [r for r in ranges if np.isfinite(r) and r > 0]
         nearest = min(ranges) if ranges else None
-        self.streak = self.streak + 1 if nearest is not None and nearest <= self.max_range else 0
-        self.near_streak = self.near_streak + 1 if nearest is not None and nearest <= self.near_range else 0
-        if self.active:
-            if now - self.last_seen > self.gap_seconds:
-                self.active = False
+        if self.count >= 2:
             return False
-        if self.near_streak >= self.frames_needed:
-            self.closing = True
-        lost = (self.closing and nearest is None and
-                now - self.last_seen >= max(self.lost_seconds, 2.5 * frame_dt))
-        if self.streak >= self.frames_needed or lost:
-            self.active = True
-            self.closing = False
-            self.count += 1
+        if nearest is None:
+            self.streak = 0
+            self.unseen_travel += max(travel, 0.0)
+            if (self.count == 1 and self.nearest <= self.near_range and
+                    now - self.last_seen >= max(self.gap_seconds, 2.5 * frame_dt) and
+                    self.unseen_travel >= 0.08):
+                self.rearmed = True
+            return False
+        self.last_seen = now
+        self.unseen_travel = 0.0
+        if self.count == 0:
+            self.count = 1
+            self.nearest = nearest
             return True
-        if self.closing and nearest is None and now - self.last_seen > self.gap_seconds:
-            self.closing = False
+        distinct = self.rearmed and nearest >= self.nearest + 0.15
+        self.streak = self.streak + 1 if distinct else 0
+        if not distinct:
+            self.rearmed = False
+            self.nearest = min(self.nearest, nearest)
+        if self.streak >= self.frames_needed and confirmed:
+            self.count = 2
+            return True
         return False
 
 
@@ -777,9 +1226,11 @@ class Mission:
         self.previous_centre = None
         self.zone = False                # inside the Speed 40 zone
         self.zone_done = False
-        self.speed40 = SignTracker(ZONE_ENTRY_RANGE, ZONE_NEAR_RANGE, frames_needed=2, gap_seconds=4.0)
+        self.speed40 = SignTracker(ZONE_NEAR_RANGE)
+        self.weak_exit = WeakBoardTracker()
         self.hospital_done = False
         self.hospital_armed = False      # a Hospital sign seen far away and approaching
+        self.hospital_streak = 0
         self.halt_started = None         # sim time the stop was commanded
         self.rest_time = None            # sim time the vehicle came to rest
         self.previous_gray = None
@@ -799,26 +1250,75 @@ class Mission:
         self.frame_dt = 0.15             # sim seconds between processed frames (measured)
         self.last_speed = 0.0
         self.approach_cap = None
+        self.travel = 0.0
+        self.frame_travel = 0.0
+        self.obstacle_pending = False
+        self.obstacle_last_seen = None
+        self.obstacle_near_seen = False
+        self.obstacle_last_travel = 0.0
+        self.obstacles_passed = 0
+        self.failed = False
+        self.school_near_frames = 0
+        self.school_last_seen = None
+        self.school_last_travel = 0.0
+        self.school_passed = False
 
     def note(self, now, text):
         print('[%7.2f] %s' % (now, text), flush=True)
 
     # ---------------- per frame ----------------
     def step(self, frame, now):
+        if not np.isfinite(now) or (self.last_now is not None and now < self.last_now):
+            raise ValueError('Invalid or decreasing simulation time')
+        dt = 0.0 if self.last_now is None else now - self.last_now
+        self.frame_travel = self.last_speed * WHEEL_RADIUS * dt
+        self.travel += self.frame_travel
         if self.last_now is not None and now > self.last_now:
             self.frame_dt = 0.7 * self.frame_dt + 0.3 * (now - self.last_now)
         self.last_now = now
         self.approach_cap = None
+        if (not isinstance(frame, np.ndarray) or frame.shape != (IMG_H, IMG_W, 3) or
+                frame.dtype != np.uint8):
+            # Account for the preceding final bounded command up to this
+            # timestamp before the invalid frame forces an immediate stop.
+            self.estimator.update(None, self.last_steering, now,
+                                  last_speed=self.last_speed)
+            self.invalidate_observations()
+            return 0.0, 0.0
         steering, speed = self._step(frame, now)
         if self.approach_cap is not None:
             speed = min(speed, self.approach_cap)
         # On a slow machine fewer frames are processed per simulated second; keep
         # the distance driven between two looks at the road bounded.
         speed = min(speed, MAX_TRAVEL_PER_FRAME / (WHEEL_RADIUS * max(self.frame_dt, 1e-3)))
-        self.last_speed = speed
+        speed = min(speed, ZONE_CRUISE if self.zone else CRUISE)
+        steering, speed = bounded_command(steering, speed)
+        self.last_steering, self.last_speed = steering, speed
+        if self.parker is not None:
+            # Record the command after every cap, for the next interval's integration.
+            self.parker.last_steering, self.parker.last_speed = steering, speed
         return steering, speed
 
+    def invalidate_observations(self):
+        self.rest_time = self.previous_gray = None
+        self.still_frames = self.park_streak = self.obstacle_streak = 0
+        self.hospital_streak = 0
+        self.last_steering = self.last_speed = 0.0
+        self.speed40.streak = 0
+        self.speed40.rearmed = False
+        self.speed40.unseen_travel = 0.0
+        self.weak_exit.reset()
+        self.school_near_frames = 0
+        if self.parker is not None:
+            self.parker.invalidate()
+
     def _step(self, frame, now):
+        # Once the Speed 40 zone has ended, route perception is no longer used
+        # during parking. Mission.step validates frames before reaching here;
+        # while the zone is active this shortcut is disabled so its exit sign
+        # remains detectable.
+        if self.parker is not None and not self.zone:
+            return self._park(frame, now)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         red = _colour_mask(hsv, "red")
         blue = _colour_mask(hsv, "blue")
@@ -828,10 +1328,23 @@ class Mission:
 
         # ---- Speed 40 zone ----
         speed40 = [s for s in signs if s["label"] == "Speed40"]
+        normal_speed40 = bool(speed40)
+        weak_speed40 = []
+        if self.zone and self.speed40.rearmed:
+            oblique = _oblique_speed40_candidates(frame)
+            weak_speed40 = self.weak_exit.update(oblique)
+            # Both trackers observe the same raw sequence. Spatial confirmation
+            # gates release, while the distinct-encounter tracker still requires
+            # two consecutive observations after near approach/travel/absence.
+            if len(oblique) == 1:
+                speed40.extend(oblique)
+        else:
+            self.weak_exit.reset()
         if VERBOSE and signs:
             self.note(now, 'signs ' + ', '.join('%s %d r=%.2f' % (s["label"], s["area"],
                       estimate_sign_range(s["bbox"])[0]) for s in signs))
-        if self.speed40.update(speed40, now, self.frame_dt):
+        if self.speed40.update(speed40, now, self.frame_dt, self.frame_travel,
+                               confirmed=normal_speed40 or bool(weak_speed40)):
             if not self.zone and not self.zone_done:
                 self.zone = True
                 self.note(now, 'Speed 40 sign: entering the zone (<= %.2f rad/s)' % ZONE_CRUISE)
@@ -839,9 +1352,10 @@ class Mission:
                 self.zone = False
                 self.zone_done = True
                 self.note(now, 'second Speed 40 sign: zone ends')
-        cap = ZONE_CRUISE if (self.zone or self.zone_done) else CRUISE
+        cap = ZONE_CRUISE if self.zone else CRUISE
         if self.parker is not None:
             return self._park(frame, now)
+        self._observe_school(signs, now)
 
         # ---- Hospital halt ----
         if not self.hospital_done:
@@ -849,31 +1363,45 @@ class Mission:
             if halted is not None:
                 return halted
 
+        # ---- lane following and obstacles ----
+        # Update obstacle evidence before considering a parking hand-over.
+        yellow, white = _lane_masks(hsv)
+        lane = detect_lane(yellow, white, self.side, self.previous_centre)
+        obstacles = detect_obstacles(hsv, red)
+        # Far red building trim is also detected by the existing 2B mask. Only
+        # ground-level near encounters (the existing change-lane row) block parking.
+        near_obstacles = [o for o in obstacles if o['base'][1] >= IMG_H * OBSTACLE_TRIGGER_ROW]
+        self._observe_obstacles(near_obstacles, now)
+
         # ---- parking hand-over ----
-        # The second Speed 40 sign is not always in view from the bend before the
-        # bay, so parking only waits for the halt and the zone to have begun.
-        if self.hospital_done and (self.zone or self.zone_done):
+        # The exit sign can face away. A visually passed School after Hospital
+        # and zone entry provides independent route progress; keep the zone cap
+        # in that case. The target marker must still satisfy the entry pose gate.
+        route_progress = self.zone_done or (self.zone and self.school_passed)
+        parking_ready = (self.hospital_done and route_progress and not self.obstacle_pending and
+                         now >= self.changing_until and lane['valid'] and not near_obstacles)
+        if parking_ready:
             corners = self._marker(frame)
+            lined_up = False
             if corners is not None:
                 # Fresh estimate each frame: on the straight the heading is ~0.
-                pose = PoseEstimator().update(corners, 0.0)
+                pose = PoseEstimator().update(corners, 0.0, now, last_speed=0.0)
                 # The estimate assumes we are parallel to the bay; coming out of the
                 # bend it reads too far left, so the gate is tight for the inner lane.
                 max_lateral = PARK_MAX_LATERAL if self.side == "left" else PARK_INNER_LATERAL
-                lined_up = (pose is not None and pose["forward"] <= PARK_START_FORWARD and
+                lined_up = (valid_pose(pose) and pose["forward"] <= PARK_START_FORWARD and
                             0.10 < pose["lateral"] < max_lateral)
-                self.park_streak = self.park_streak + 1 if lined_up else 0
-                if self.park_streak >= 3:
-                    self.note(now, 'parking: marker at %.2f m, lateral %.2f m'
-                              % (pose["forward"], pose["lateral"]))
-                    self.parker = Parker()
-                    self.estimator = PoseEstimator()
-                    self.estimator.update(corners, 0.0)
-                    return self._drive_parking(pose, now)
+            self.park_streak = self.park_streak + 1 if lined_up else 0
+            if self.park_streak >= 3:
+                self.note(now, 'parking: marker at %.2f m, lateral %.2f m'
+                          % (pose["forward"], pose["lateral"]))
+                self.parker = Parker()
+                self.estimator = PoseEstimator()
+                self.estimator.update(corners, 0.0, now, last_speed=0.0)
+                return self._drive_parking(pose, now)
+        else:
+            self.park_streak = 0
 
-        # ---- lane following and obstacles ----
-        yellow, white = _lane_masks(hsv)
-        lane = detect_lane(yellow, white, self.side, self.previous_centre)
         if not lane["valid"]:
             self.lost_frames += 1
             speed = cap * 0.5 if self.lost_frames < 10 else 0.0
@@ -883,7 +1411,6 @@ class Mission:
             self.side = lane["side"]
             self.note(now, 'starting in the %s-edged lane' % self.side)
 
-        obstacles = detect_obstacles(hsv, red)
         if VERBOSE and obstacles:
             self.note(now, 'obstacles ' + ', '.join('box %s in-lane %s' % (o["bbox"], obstacle_in_lane(o, lane))
                                                     for o in obstacles) + ' side %s' % self.side)
@@ -910,14 +1437,47 @@ class Mission:
         return steering, speed
 
     # ---------------- helpers ----------------
+    def _observe_school(self, signs, now):
+        if self.school_passed or not (self.hospital_done and (self.zone or self.zone_done)):
+            return
+        school = [s for s in signs if s['label'] == 'School']
+        if school:
+            near = min(estimate_sign_range(s['bbox'])[0] for s in school) <= ZONE_NEAR_RANGE
+            self.school_near_frames = self.school_near_frames + 1 if near else 0
+            self.school_last_seen = now
+            self.school_last_travel = self.travel
+        elif (self.school_near_frames >= 2 and self.school_last_seen is not None and
+              now - self.school_last_seen >= max(0.4, 2.5 * self.frame_dt) and
+              self.travel - self.school_last_travel >= 0.08):
+            self.school_passed = True
+            self.note(now, 'School sign passed after Hospital and Speed 40 entry; driving on')
+
+    def _observe_obstacles(self, obstacles, now):
+        if obstacles:
+            self.obstacle_pending = True
+            self.obstacle_last_seen = now
+            self.obstacle_last_travel = self.travel
+            self.obstacle_near_seen |= any(o['base'][1] >= IMG_H * OBSTACLE_TRIGGER_ROW
+                                           for o in obstacles)
+        elif (self.obstacle_pending and self.obstacle_near_seen and
+              now - self.obstacle_last_seen >= max(0.4, 2.5 * self.frame_dt) and
+              self.travel - self.obstacle_last_travel >= 0.12):
+            # Camera disappearance after a near encounter plus forward command
+            # history supports passing. It cannot prove unseen obstacles are absent.
+            self.obstacle_pending = False
+            self.obstacle_near_seen = False
+            self.obstacles_passed += 1
+
     def _hospital(self, frame, signs, now):
         if self.halt_started is not None:
             gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (80, 60)).astype(np.float32)
             if self.previous_gray is not None:
                 moving = float(np.mean(np.abs(gray - self.previous_gray))) > 0.6
                 self.still_frames = 0 if moving else self.still_frames + 1
+                if moving:
+                    self.rest_time = None
             self.previous_gray = gray
-            if self.rest_time is None and (self.still_frames >= 2 or now - self.halt_started > 1.5):
+            if self.rest_time is None and self.still_frames >= 2:
                 self.rest_time = now
                 self.note(now, 'at rest - holding %.1f s' % (HALT_SECONDS + HALT_MARGIN))
             if self.rest_time is not None and now - self.rest_time >= HALT_SECONDS + HALT_MARGIN:
@@ -928,13 +1488,18 @@ class Mission:
 
         hospital = [s for s in signs if s["label"] == "Hospital"]
         if not hospital:
+            self.hospital_streak = 0
             return None
         ranged = [estimate_sign_range(s["bbox"]) for s in hospital]
         ranged = [r for r in ranged if 0.05 <= r[1] <= 0.30]   # roadside, to the right
         if not ranged:
+            self.hospital_streak = 0
             return None
         forward, lateral = min(ranged, key=lambda r: r[0])
-        if forward > HOSPITAL_ARM_RANGE:
+        self.hospital_streak += 1
+        if (forward > HOSPITAL_ARM_RANGE or
+                (self.hospital_streak >= 2 and
+                 forward > HOSPITAL_STOP_RANGE + HALT_COAST + 0.02)):
             if not self.hospital_armed:
                 self.note(now, 'Hospital sign ahead at %.2f m' % forward)
             self.hospital_armed = True
@@ -965,11 +1530,13 @@ class Mission:
 
     def _park(self, frame, now):
         corners = self._marker(frame)
-        pose = self.estimator.update(corners, self.last_steering)
+        pose = self.estimator.update(corners, self.last_steering, now,
+                                     last_speed=self.last_speed)
         return self._drive_parking(pose, now)
 
     def _drive_parking(self, pose, now=None):
         steering, speed, parked = self.parker.step(pose, now)
+        self.failed = self.parker.failed
         if VERBOSE:
             self.note(now, 'park pose %s -> steer %.3f speed %.2f parked %s' % (
                 None if pose is None else {k: round(v, 3) for k, v in pose.items()},
@@ -978,9 +1545,7 @@ class Mission:
             self.finished = True
             return 0.0, 0.0
         self.last_steering = steering
-        # The second Speed 40 sign is not reliably in view on the way into the bay,
-        # so the zone limit is kept all the way into the spot.
-        return steering, min(speed, ZONE_CRUISE)
+        return steering, speed
 
 
 # ============================================================
@@ -1004,17 +1569,29 @@ def connect_and_locate():
 def read_frame(sim, handles):
     sim.handleVisionSensor(handles['vision_sensor'])
     img, res = sim.getVisionSensorImg(handles['vision_sensor'], 0)
-    if len(img) == 0:
+    if img is None or not res or len(res) != 2 or tuple(res) != (IMG_W, IMG_H):
         return None
-    frame = np.frombuffer(img, dtype=np.uint8).reshape((res[1], res[0], 3))
+    try:
+        if len(img) != res[0] * res[1] * 3:
+            return None
+        frame = np.frombuffer(img, dtype=np.uint8).reshape((res[1], res[0], 3))
+    except (TypeError, ValueError):
+        return None
     frame = cv2.flip(frame, 0)
     return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
 
+def bounded_command(steering, speed):
+    if not np.isfinite([steering, speed]).all():
+        return 0.0, 0.0
+    speed = float(np.clip(speed, 0.0, SPEED_LIMIT))
+    steering = float(np.clip(steering, -_virtual_steering_limit(), _virtual_steering_limit()))
+    return steering, speed
+
+
 def drive(sim, handles, steering, speed):
-    speed = float(np.clip(speed, 0.0, SPEED_LIMIT - 0.05))
-    left, right = ackermann_wheel_angles(float(np.clip(steering, -_virtual_steering_limit(),
-                                                       _virtual_steering_limit())))
+    steering, speed = bounded_command(steering, speed)
+    left, right = ackermann_wheel_angles(steering)
     sim.setJointTargetPosition(handles['steer_left'], left)
     sim.setJointTargetPosition(handles['steer_right'], right)
     sim.setJointTargetVelocity(handles['motor_left'], speed)
@@ -1022,50 +1599,59 @@ def drive(sim, handles, steering, speed):
 
 
 def main():
-    sim, handles = connect_and_locate()
-    deadline = time.monotonic() + 120.0
-    if sim.getSimulationState() != sim.simulation_advancing_running:
-        print('Waiting for the simulation to start - press Play in CoppeliaSim.', flush=True)
-    while sim.getSimulationState() != sim.simulation_advancing_running:
-        if time.monotonic() > deadline:
-            print('The simulation never started.')
-            return 1
-        time.sleep(0.05)
-    print('Simulation running - Task 3 lap.', flush=True)
-
-    mission = Mission()
+    sim, handles = None, None
     frames = 0
+    result = 0
     try:
-        while sim.getSimulationState() == sim.simulation_advancing_running:
-            frame = read_frame(sim, handles)
-            if frame is None:
+        sim, handles = connect_and_locate()
+        deadline = time.monotonic() + 120.0
+        mission = Mission()
+        started = False
+        print('Waiting for the simulation to run - Task 3 lap.', flush=True)
+        advancing = {sim.simulation_advancing_firstafterstop, sim.simulation_advancing_running,
+                     sim.simulation_advancing_firstafterpause}
+        stopping = {sim.simulation_advancing_abouttostop, sim.simulation_advancing_lastbeforestop}
+        while True:
+            state = sim.getSimulationState()
+            if state in stopping or (started and state == sim.simulation_stopped):
+                break
+            if state not in advancing:
+                drive(sim, handles, 0.0, 0.0)
+                mission.invalidate_observations()
+                if not started and time.monotonic() > deadline:
+                    raise TimeoutError('The simulation never started.')
+                time.sleep(0.05)
                 continue
-            frames += 1
+            started = True
+            frame = read_frame(sim, handles)
             now = sim.getSimulationTime()
             steering, speed = mission.step(frame, now)
             drive(sim, handles, steering, speed)
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            frames += 1
+            if mission.failed:
+                raise RuntimeError('Parking target reached without valid alignment; stopped.')
             if mission.finished:
                 mission.note(now, 'parked')
                 break
-        if mission.finished:
-            # Let the vehicle settle so it is at rest when the run ends.
-            settle = sim.getSimulationTime()
-            while (sim.getSimulationState() == sim.simulation_advancing_running and
-                   sim.getSimulationTime() - settle < 1.0):
-                drive(sim, handles, 0.0, 0.0)
-                time.sleep(0.01)
     except KeyboardInterrupt:
         print('\nInterrupted.')
+        result = 130
     except Exception as err:
         print('Loop ended: %s: %s' % (type(err).__name__, err))
+        result = 1
     finally:
-        try:
-            sim.setJointTargetVelocity(handles['motor_left'], 0.0)
-            sim.setJointTargetVelocity(handles['motor_right'], 0.0)
-        except Exception:
-            pass
+        if sim is not None and handles is not None:
+            for motor in ('motor_left', 'motor_right'):
+                try:
+                    sim.setJointTargetVelocity(handles[motor], 0.0)
+                except Exception as err:
+                    print('Could not stop %s: %s' % (motor, err))
+                    result = 1
     print('%d frames processed.' % frames)
-    return 0
+    return result
 
 
 if __name__ == '__main__':
