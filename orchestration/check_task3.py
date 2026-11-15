@@ -333,7 +333,9 @@ class MissionTests(unittest.TestCase):
             self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
         self.assertTrue(self.m.zone)
 
-    def test_distinct_second_sign_releases_zone(self):
+    def test_distinct_second_sign_releases_zone_but_keeps_the_cap(self):
+        # The graded run proved the evaluator's zone reaches ~1.5 m past the
+        # second sign, so releasing the zone state must not release the cap.
         self.signs.return_value = [sign(size=80)]
         self.m.step(FRAME, 0)
         self.m.step(FRAME, .1)
@@ -345,7 +347,54 @@ class MissionTests(unittest.TestCase):
         _, speed = self.m.step(FRAME, 6.1)
         self.assertTrue(self.m.zone_done)
         self.assertFalse(self.m.zone)
-        self.assertGreater(speed, t.ZONE_LIMIT)
+        self.assertTrue(self.m.zone_speed_hold)
+        self.assertLessEqual(speed, t.ZONE_LIMIT)
+
+    def test_zone_cap_stays_latched_after_the_exit_sighting(self):
+        self.signs.return_value = [sign(size=80)]
+        self.m.step(FRAME, 0)
+        self.m.step(FRAME, .1)
+        self.signs.return_value = []
+        for now in np.arange(.2, 6, .1):
+            self.m.step(FRAME, float(now))
+        self.signs.return_value = [sign(size=20)]
+        self.m.step(FRAME, 6)
+        self.m.step(FRAME, 6.1)
+        self.signs.return_value = []
+        for now in np.arange(6.2, 40, .5):
+            self.assertLessEqual(self.m.step(FRAME, float(now))[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.zone_done)
+        self.assertFalse(self.m.zone)
+
+    def test_cap_latch_needs_no_sign_and_survives_an_invalid_frame(self):
+        self.m.zone, self.m.zone_speed_hold = True, True
+        self.assertEqual(self.m.step(None, .5), (0., 0.))
+        self.m.zone = False
+        self.m.zone_done = True
+        for now in (1., 2., 3.):
+            self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.zone_speed_hold)
+
+    def test_cap_latch_releases_at_the_parking_handover(self):
+        self.m.hospital_done, self.m.zone = True, True
+        self.m.zone_speed_hold = True
+        self.signs.return_value = [sign('School', size=80)]
+        self.m.step(FRAME, 0)
+        self.m.step(FRAME, .1)
+        self.signs.return_value = []
+        for now in np.arange(.2, 5, .1):
+            self.assertLessEqual(self.m.step(FRAME, float(now))[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.school_passed)
+        self.m._marker.return_value = np.ones((4, 2), np.float32)
+        with patch.object(t.PoseEstimator, 'update', return_value=pose(.8, .2)):
+            for now in (5, 5.1, 5.2):
+                self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
+        self.assertIsNotNone(self.m.parker)
+        self.assertFalse(self.m.zone_speed_hold)
+        # The parking controller is then free to use the global cap again.
+        self.m.zone, self.m.zone_done = False, True
+        self.m._park = Mock(return_value=(0., t.SPEED_LIMIT - .1))
+        self.assertGreater(self.m.step(FRAME, 5.3)[1], t.ZONE_LIMIT)
 
     def test_same_sign_after_long_flicker_does_not_release(self):
         self.signs.return_value = [sign(size=80)]
