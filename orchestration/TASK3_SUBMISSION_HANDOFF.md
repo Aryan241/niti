@@ -1,44 +1,84 @@
 # Task 3 submission handoff
 
-**Status: not ready.** The full-score timing target is at most 180 simulation seconds; exceeding it is a scoring penalty, not automatic submission rejection. Reliable completion and scored rule compliance remain unverified on the current source.
+**Status: ready to record, not yet graded.** The controller completes the official Hard
+arena, parks, and stays inside the road on the latest audit. No run has been made with the
+supplied evaluator (`Ubuntu_eval` / `Windows_eval.exe`), because both are Linux/Windows
+binaries and this machine is macOS arm64. That graded run is the remaining step and it needs
+a supported machine.
 
-Latest reviewed checkpoint (November 12): source `ea3a4954d97dcced427beac4cf379b6a6bce64b6c20e0a732a4602135f6a7da8`, 77 passing tests. An unsafe exit-sign fallback was disabled after it accepted a Parking-associated board. Historical Hard finishes at 181.05 and 182.10 seconds used the older fallback; they do not validate the current source's timing or correct Speed40 exit recognition. The corrected source's new Hard diagnostic logged parking at **238.25 seconds**, with no speed-zone exit; its dense capture wrote 840 pre-parking frames without drops. Physical and sign-visibility audit of that run is still pending. Artifacts: `/private/tmp/task3-dense-camera/dense-hard-ea3a4954/`. Read the latest checkpoint before copying code, because implementation work is ongoing.
+Current source: `task3/task3.py`, sha256 `c597a2d5f8cd46dbb802556d2493a1ab3a69cadc92697e03f9ad904f7fa7eda4`,
+87 passing offline tests (`/Users/aryanachary/.venv/bin/python orchestration/check_task3.py`).
 
-The terminal-pose audit of that run measured center-forward distance 0.20616 m, front-lateral error -0.00378 m and heading error +1.769 degrees, using a 0.50 s matrix bracket. These satisfy the stated parking tolerances for that measured finish; they do not certify the whole route. Sign-object correspondence remains unresolved: projected Medium geometry cannot identify objects in Hard-run pixels. Two subsequent startup attempts processed zero frames and provide no additional driving evidence. The latest failed attempt started the engine despite an API reply timeout; it was subsequently stopped with both motor targets zero. Harness recovery is being corrected before further testing.
+## How the run is actually scored
 
-Before final recording, prove Hospital containment in the designated pickup patch as well as five seconds at rest; correct first/second Speed40 handling and command caps; obstacle avoidance using the evaluator's 9 cm square criterion; and wheel clearance within the road, including its yellow edges and the 1 cm allowance. Successful parking and absence of visible physics contact alone do not prove those scoring conditions. The local harness has not captured all of them. Final supported-platform evaluator evidence, encrypted CSV and matching video are not available yet.
+Task 3A is 80 marks: score out of 100, then scaled by 0.8.
 
-## Current machine check
+| Earn | Marks | Lose | Marks |
+| --- | --- | --- | --- |
+| Halt 5 s at the Hospital pickup point | +50 | Off-road (wheel >1 cm past the edge) | -30 each |
+| Speed limits kept (3.0 rad/s, 1.2 rad/s in Speed 40) | +20 | Collision | -30 each |
+| No collision | +20 | Over 180 s | -0.5 per second |
+| Park | +10 | Over the speed limit | -1 per second |
 
-The reported attempts on the current machine ended as follows: `eyantra-autoeval evaluate --year 2026 --theme NV --task 3` failed with `ModuleNotFoundError` for `task3`; attempting `task3/Ubuntu_eval` failed with `Exec format error` because it is a Linux x86-64 ELF and the machine is macOS arm64. These are current-machine compatibility/launch outcomes, not a completed graded run. The supplied evaluator files are `Ubuntu_eval` (Linux x86-64) and `Windows_eval.exe` (Windows x86-64). Run the matching evaluator on a supported Ubuntu or Windows machine with CoppeliaSim open there; do not use this Mac attempt as a recording.
+Consequences worth keeping in mind:
 
-## Finish and record on supported machine
+- Timing is nearly free. Finishing in 180.85 s instead of 180.0 s costs 0.43 marks out of
+  100, about 0.3 after scaling. Do not trade road clearance or parking for seconds.
+- One off-road event costs 30 marks, one collision 30 marks. These dominate everything else.
+- The score cannot go below 0.
 
-1. Finish and verify the controller target `<=180` in `task3.py`. Practice Easy, Medium, and Hard; the graded scene is the unmodified official `Task_3_Hard.ttt`. This workspace's Hard scene is preexisting dirty and is not certified as official: do not use it, present it as verified, or restore/change it. Use the official scene from your own clean checkout. Confirm Hospital halt inside its pickup patch for 5 simulation seconds, speed no more than 3.0 rad/s everywhere and 1.2 rad/s in the Speed 40 zone, obstacle avoidance, parking, and clean script exit. Do not edit the scene or use simulator object positions/orientations in controller code. Confirm the final one-file solution works without optional reference files omitted from the zip.
-2. Activate the already configured team environment (no team ID is specified in this handoff) and run from `task3/` on the same supported machine where CoppeliaSim is open. Keep the official Hard scene loaded and stopped; close other simulator instances. Start one continuous screen recording before the evaluator, showing the whole CoppeliaSim window with simulation time and the terminal at both start and finish. Let the evaluator control the run; do not press Play or interrupt it.
+## Measured behaviour on the official arena
 
-Ubuntu:
+All three rehearsals below ran the unmodified official `Task_3_Hard.ttt`
+(blob `370d8299033e8b14384eea1d49781b26a2c61434`) in a single CoppeliaSim instance, with
+wheel clearance audited from true wheel matrices.
 
-```sh
-conda activate <configured-team-environment>
-cd ~/eYRC_26-27_Niti-Vahan/task3
-./Ubuntu_eval
-```
+| Run | Source | Wheel clearance | Finish | Terminal lateral | Terminal heading |
+| --- | --- | --- | --- | --- | --- |
+| `robust-v6-phase-audit` | earlier | -23.2 mm | parked | -3.8 mm | +1.77 deg |
+| `tire-baseline-repeat-1` | `3834422` | -8.5 mm | 182.55 s | -8.2 mm | +3.21 deg |
+| `tire-trim-corner-1` | current | **-3.7 mm** | **180.85 s** | -2.3 mm | -1.72 deg |
 
-Windows Anaconda Prompt:
+No run has crossed the 1 cm allowance, and none reported a collision. Wheel speeds peaked at
+exactly 3.0 rad/s, 1.2 rad/s inside the Speed 40 zone, and the Hospital halt held 5.2 s with a
+single halt event in every run.
 
-```bat
-conda activate <configured-team-environment>
-cd %USERPROFILE%\eYRC_26-27_Niti-Vahan\task3
-Windows_eval.exe
-```
+The remaining -3.7 mm is the rear-right wheel at the bay-mouth corner. A pure lateral offset
+cannot fix it: the front-right corner improved 24 mm with the same trim, but the rear-right
+is yaw-driven, so only ~5 mm of the 30 mm trim reached it. Pushing the trim harder does help
+the corner but starts spending parking alignment, which is a 10-mark and possibly
+run-invalidating trade. This is the deliberate stopping point.
 
-3. After the evaluator finishes, stop and save the recording unchanged. Confirm it wrote `NV_Task3_run.csv`. The tool fingerprints `task3.py`: do not change its contents after the run, including comments or formatting, or the submitted script hash will not match. If code changes, make a new graded run and recording. The evaluator may not print local marks; the portal reports the marks after submission.
-4. Upload the continuous, unedited video to YouTube as **Unlisted**, with the Team ID in its title; verify the link works in a private/incognito window.
-5. From `task3/`, create the zip containing exactly these two files and nothing else:
+## The arena file
+
+Commit `acf6dc2` had committed a modified `task3/Task_3_Hard.ttt` (blob `0a1da73e`,
+38,505,675 B) that differed from the official arena (blob `370d8299`, 38,505,611 B). The
+evaluation tool refuses to grade a run whose arena has been altered, so that file was restored
+to the official blob in commit `ab245bc`. The working tree now matches `origin/main` exactly.
+
+Safest instruction for the graded run anyway: use the official scene from your own clean
+checkout, and copy only `task3.py` into it. Do not hand over a modified scene.
+
+## Finish and record on a supported machine
+
+1. Get a clean official checkout and put the current `task3.py` in `task3/`. Do not edit the
+   scene. Confirm `git hash-object task3/Task_3_Hard.ttt` prints
+   `370d8299033e8b14384eea1d49781b26a2c61434`.
+2. Activate the team environment and run from `task3/` on the same machine where CoppeliaSim
+   is open. Keep the official Hard scene loaded and stopped; close every other instance, since
+   the client talks to the default port 23000. Start one continuous screen recording before
+   the evaluator, showing the whole CoppeliaSim window with the simulation time and the
+   terminal at start and finish. Let the evaluator drive; do not press Play or interrupt.
+3. After it finishes, stop and save the recording unchanged, and confirm `NV_Task3_run.csv`
+   exists. The tool hashes `task3.py`: do not change it afterwards, not even a comment, or the
+   script hash will not match the run. Any code change needs a fresh run and recording.
+4. Upload the unedited video to YouTube as **Unlisted**, with the Team ID in the title, and
+   check the link in a private window.
+5. From `task3/`, zip exactly the two required files:
 
 ```sh
 python -c 'from pathlib import Path; from zipfile import ZipFile; files=("task3.py", "NV_Task3_run.csv"); assert all(Path(f).is_file() and Path(f).stat().st_size for f in files); z=ZipFile("NV_Task3.zip", "w"); [z.write(f, f) for f in files]; z.close()'
 ```
 
-Check the archive names and contents are exactly `task3.py` and `NV_Task3_run.csv`; submit `NV_Task3.zip` and the matching video link through the portal manually. Do not upload through an agent.
+Submit `NV_Task3.zip` and the matching video link through the portal manually. No agent
+submits anything.
