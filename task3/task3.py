@@ -18,8 +18,8 @@
 *****************************************************************************************
 '''
 
-# Team ID:          < Team-ID >
-# Author List:      < Names of the team members who worked on this file, comma separated >
+# Team ID:          < 5208 >
+# Author List:      < Aryan Achary, Anushka Priya, Aaryan Salunke, Robin Punnen Alex >
 # Filename:         task3.py
 # Functions:        detect_lane, detect_signs, detect_obstacles, estimate_sign_range,
 #                   lane_control, parking_manoeuvre, Mission.step, main
