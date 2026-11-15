@@ -680,12 +680,79 @@ class ParkerTests(unittest.TestCase):
         self.assertLess(max(candidate_curvatures), 3.8)
 
         # The coordinate translation changes where the existing quintic lies,
-        # not its normalized smootherstep profile.
-        for ratio in np.linspace(0.0, 1.0, 11):
+        # not its normalized smootherstep profile. Sample only outside the
+        # corner-trim window, where the profile must be exact.
+        for ratio in (0.0, .1, .2, .3, .4, .85, .9, 1.0):
             actual = p._path_reference(t.Parker.MERGE_END_REAR + ratio *
                                        (p.start_rear_forward - t.Parker.MERGE_END_REAR))[0]
             expected = p.start_rear_lateral * (6*ratio**5 - 15*ratio**4 + 10*ratio**3)
             self.assertAlmostEqual(actual, expected, places=10)
+
+    def _merge_pair(self, entry, start=None):
+        start = .856 + t.WHEELBASE / 2 if start is None else start
+
+        class NoTrim(t.Parker):
+            MERGE_CLEARANCE = 0.0
+
+        tuned, plain = t.Parker(), NoTrim()
+        for p in (tuned, plain):
+            p.start_rear_lateral, p.start_rear_forward = entry, start
+            p._path_reference(p.start_rear_forward)
+        span = tuned.start_rear_forward - tuned.merge_end_rear
+        return tuned, plain, span
+
+    def test_merge_clearance_trim_is_local_to_the_bay_mouth_corner(self):
+        tuned, plain, span = self._merge_pair(.238)
+        at = lambda p, r: p._path_reference(p.merge_end_rear + r * span)[0]
+        centre, half = (t.Parker.MERGE_CLEARANCE_CENTER,
+                        t.Parker.MERGE_CLEARANCE_HALF_WIDTH)
+        # Merge entry keeps the measured offset exactly.
+        self.assertAlmostEqual(at(tuned, 1.0), .238, places=8)
+        # Peak sits on the measured corner and equals the configured width.
+        self.assertAlmostEqual(at(tuned, centre) - at(plain, centre),
+                               t.Parker.MERGE_CLEARANCE, places=10)
+        # Outside the window the reference is untouched, so both the entry and
+        # the whole terminal approach run on the unmodified profile.
+        for ratio in (0.0, .1, .25, .4, centre - half, centre + half, .9, 1.0):
+            self.assertAlmostEqual(at(tuned, ratio), at(plain, ratio), places=10)
+        # Continuous at the window edges: approach zero rather than stepping.
+        for ratio in (centre - half - 1e-6, centre + half + 1e-6):
+            self.assertAlmostEqual(at(tuned, ratio), at(plain, ratio), places=10)
+        for ratio in (.45, .55, centre, .7):
+            self.assertGreater(at(tuned, ratio), at(plain, ratio))
+
+    def test_merge_clearance_trim_mirrors_with_entry_side(self):
+        centre = t.Parker.MERGE_CLEARANCE_CENTER
+        for entry in (.26, -.26):
+            tuned, plain, span = self._merge_pair(entry)
+            mid = tuned.merge_end_rear + centre * span
+            # Always away from the bay centreline, i.e. to the outside of the turn.
+            self.assertAlmostEqual(tuned._path_reference(mid)[0] -
+                                   plain._path_reference(mid)[0],
+                                   np.sign(entry) * t.Parker.MERGE_CLEARANCE, places=10)
+
+    def test_merge_clearance_trim_steers_away_from_the_cut_corner(self):
+        # Entry on the +lateral side means a rightward merge with the corner on
+        # the right. A pose on the untrimmed corner reference must now be
+        # steered further out (left) than before.
+        tuned, baseline, span = self._merge_pair(.26, .85)
+        rear_forward = tuned.merge_end_rear + t.Parker.MERGE_CLEARANCE_CENTER * span
+        untrimmed_lateral, slope, _ = baseline._path_reference(rear_forward)
+        trimmed_lateral, _, _ = tuned._path_reference(rear_forward)
+        self.assertGreater(trimmed_lateral, untrimmed_lateral)
+        # Sit the car exactly on the untrimmed reference, facing along it, so
+        # the baseline commands only the curvature feed-forward. The trim is a
+        # lateral-only offset, so the two agree on heading and differ on cross-track.
+        heading = -np.arctan(slope)
+        sample = pose(rear_forward - t.WHEELBASE / 2 * np.cos(heading),
+                      untrimmed_lateral + t.WHEELBASE * np.sin(heading), heading)
+        tuned_steer, tuned_speed, _ = tuned.step(sample, 0)
+        baseline_steer, _, _ = baseline.step(sample, 0)
+        self.assertGreater(tuned_steer, baseline_steer)
+        self.assertAlmostEqual(untrimmed_lateral - trimmed_lateral,
+                               -t.Parker.MERGE_CLEARANCE, places=10)
+        self.assertLessEqual(abs(tuned_steer), t._virtual_steering_limit())
+        self.assertGreater(tuned_speed, 0)
 
     def test_cubic_profile_derivatives_and_feasibility_fallback(self):
         p = t.Parker()

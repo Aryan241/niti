@@ -917,6 +917,21 @@ class Parker:
     UNCERTAIN_EDGE_STOP_MARGIN = np.deg2rad(15.0)
     TRACK_LATERAL_SCALE = 0.060        # m; scale from live safe-run error distribution
     TRACK_HEADING_SCALE = 0.20         # rad
+    # Width of the mid-merge line. Two rehearsals on the official Hard arena
+    # put the inner (right, in that run) wheels 8.5 mm and 23.2 mm outside the
+    # road at the bay-mouth corner, sim ~169 s, while the outer wheels kept
+    # >=93 mm. Truth sampling of that run localises the drift: the realised
+    # rear-axle lateral runs ~30 mm below this reference through roughly
+    # r=0.45..0.75 of the merge, peaking ~35 mm at r=0.62, and is back on the
+    # reference by r=0.4 and r=0.8. So aim this far to the outside of the turn
+    # across that corner only, and let the whole terminal approach run on the
+    # unmodified reference. The trim follows the sign of the entry offset, so
+    # it widens the turn on either approach and the planner stays
+    # mirror-symmetric. It is a pure lateral offset: heading and curvature
+    # feed-forward are unchanged, so this adds no turning demand.
+    MERGE_CLEARANCE = 0.030
+    MERGE_CLEARANCE_CENTER = 0.62      # normalized merge progress of the corner
+    MERGE_CLEARANCE_HALF_WIDTH = 0.20  # trim is C1-zero outside this window
     CUBIC_BEARING_RESERVE = np.deg2rad(5.0)
     CUBIC_CURVATURE_RESERVE = 0.90
 
@@ -955,6 +970,14 @@ class Parker:
         self.rest_time = None
         self.last_pose = None
         self.last_steering = self.last_speed = 0.0
+
+    @classmethod
+    def _merge_trim(cls, ratio):
+        """Lateral trim for the bay-mouth corner, zero outside its window."""
+        u = (ratio - cls.MERGE_CLEARANCE_CENTER) / cls.MERGE_CLEARANCE_HALF_WIDTH
+        if abs(u) >= 1.0:
+            return 0.0
+        return cls.MERGE_CLEARANCE * float(np.sin(0.5 * np.pi * (1.0 + u)) ** 2)
 
     def _path_reference(self, rear_forward):
         # The quintic's hand-off, progress and cross-track error all use the
@@ -1015,14 +1038,16 @@ class Parker:
                         r = float(np.clip(raw, 0.0, 1.0))
                         feasible = True
             self.path_profile = 'cubic' if feasible else 'quintic'
+        # Only the bay-mouth corner is trimmed; zero inside the terminal approach.
+        trim = np.sign(self.start_rear_lateral) * self._merge_trim(r)
         if self.path_profile == 'cubic':
-            lateral = self.start_rear_lateral * (3 * r ** 2 - 2 * r ** 3)
+            lateral = self.start_rear_lateral * (3 * r ** 2 - 2 * r ** 3) + trim
             if not 0.0 < raw < 1.0:
                 return lateral, 0.0, 0.0
             slope = self.start_rear_lateral * (6 * r - 6 * r ** 2) / span
             second = self.start_rear_lateral * (6 - 12 * r) / (span * span)
             return lateral, slope, second / (1.0 + slope * slope) ** 1.5
-        lateral = self.start_rear_lateral * (6 * r ** 5 - 15 * r ** 4 + 10 * r ** 3)
+        lateral = self.start_rear_lateral * (6 * r ** 5 - 15 * r ** 4 + 10 * r ** 3) + trim
         if not 0.0 < raw < 1.0:
             return lateral, 0.0, 0.0
         slope = self.start_rear_lateral * (30 * r ** 4 - 60 * r ** 3 + 30 * r ** 2) / span
