@@ -414,18 +414,20 @@ class MissionTests(unittest.TestCase):
         self.signs.return_value = []
         for now in np.arange(.2, 6, .1):
             self.m.step(FRAME, float(now))
-        self.signs.return_value = [sign(size=20)]
+        self.signs.return_value = [sign(size=24)]
         self.assertLessEqual(self.m.step(FRAME, 6)[1], t.ZONE_LIMIT)
         self.assertTrue(self.m.zone_speed_hold)
-        _, speed = self.m.step(FRAME, 6.1)
+        self.assertLessEqual(self.m.step(FRAME, 6.1)[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.zone_speed_hold)
+        _, speed = self.m.step(FRAME, 6.2)
         self.assertTrue(self.m.zone_done)
         self.assertFalse(self.m.zone)
         self.assertFalse(self.m.zone_speed_hold)
         self.assertGreater(speed, t.ZONE_LIMIT)
         self.assertLessEqual(speed, t.SPEED_LIMIT)
         message = self.m.note.call_args.args[1]
-        for evidence in ('second Speed 40 confirmed: cap released', 'source=normal',
-                         'bbox=', 'range=', 'count=2', 'rearmed=True', 'streak=2'):
+        for evidence in ('readable second Speed40 confirmed: cap released', 'source=normal',
+                         'bbox=', 'range=', 'count=2', 'rearmed=True', 'streak=3'):
             self.assertIn(evidence, message)
 
     def test_released_zone_does_not_recap_without_signs(self):
@@ -435,18 +437,19 @@ class MissionTests(unittest.TestCase):
         self.signs.return_value = []
         for now in np.arange(.2, 6, .1):
             self.m.step(FRAME, float(now))
-        self.signs.return_value = [sign(size=20)]
+        self.signs.return_value = [sign(size=24)]
         self.m.step(FRAME, 6)
         self.m.step(FRAME, 6.1)
+        self.m.step(FRAME, 6.2)
         self.signs.return_value = []
-        for now in np.arange(6.2, 40, .5):
+        for now in np.arange(6.3, 40, .5):
             self.assertGreater(self.m.step(FRAME, float(now))[1], t.ZONE_LIMIT)
         self.assertTrue(self.m.zone_done)
         self.assertFalse(self.m.zone)
 
     def test_invalid_frame_after_confirmed_release_does_not_recap(self):
         self.test_distinct_second_sign_releases_zone_and_cap_immediately()
-        self.assertEqual(self.m.step(None, 6.2), (0., 0.))
+        self.assertEqual(self.m.step(None, 6.25), (0., 0.))
         self.signs.return_value = []
         for now in (6.3, 6.4, 6.5):
             self.assertGreater(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
@@ -751,28 +754,37 @@ class SecondSignPolicyTests(unittest.TestCase):
                 self.assert_capped(now)
         self.assertEqual(self.m.speed40.streak, 0)
 
-    def test_duplicate_normal_and_oblique_confirm_on_second_frame(self):
+    def test_duplicate_normal_and_oblique_needs_three_readable_frames(self):
         self.rearm()
-        self.signs.return_value = [sign(size=20)]
-        with patch.object(t, '_oblique_speed40_candidates', return_value=[sign(size=20)]):
+        self.signs.return_value = [sign(size=24)]
+        with patch.object(t, '_oblique_speed40_candidates', return_value=[sign(size=24)]):
             self.assert_capped(6.)
-            self.assertGreater(self.m.step(FRAME, 6.1)[1], t.ZONE_LIMIT)
-        self.assertTrue(self.m.zone_done)
+            self.assertLessEqual(self.m.step(FRAME, 6.1)[1], t.ZONE_LIMIT)
+            self.assertTrue(self.m.zone_done)
+            self.assertTrue(self.m.zone_speed_hold)
+            self.assertGreater(self.m.step(FRAME, 6.2)[1], t.ZONE_LIMIT)
         self.assertFalse(self.m.zone_speed_hold)
         self.assertIn('source=normal', self.m.note.call_args.args[1])
 
-    def test_strong_oblique_second_pair_releases_and_stops_exit_perception(self):
+    def test_exact_log4_oblique_route_exit_retains_cap_after_dropout_and_travel(self):
         self.rearm()
-        candidate = dict(sign(size=20), strong=True)
+        candidate = dict(label='Speed40', bbox=(606, 39, 33, 52), area=1716, strong=True)
+        self.assertAlmostEqual(t.estimate_sign_range(candidate['bbox'])[0], .548, places=3)
         with patch.object(t, '_oblique_speed40_candidates', return_value=[candidate]) as detector:
             self.assert_capped(6.)
-            self.assertGreater(self.m.step(FRAME, 6.1)[1], t.ZONE_LIMIT)
-            self.assertIn('source=oblique', self.m.note.call_args.args[1])
-            self.assertIn('bbox=', self.m.note.call_args.args[1])
-            self.assertIn('range=', self.m.note.call_args.args[1])
-            for now in (6.2, 6.3):
-                self.assertGreater(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
+            self.assertLessEqual(self.m.step(FRAME, 6.1)[1], 1.2)
+            message = self.m.note.call_args.args[1]
+            for evidence in ('source=oblique', 'bbox=(606, 39, 33, 52)', 'range=0.548',
+                             'cap retained: readable exit unverified'):
+                self.assertIn(evidence, message)
+            self.assertTrue(self.m.zone_done)
+            self.assertFalse(self.m.zone)
+            self.assertTrue(self.m.zone_speed_hold)
+            for now in np.arange(6.2, 60., .2):
+                self.assertLessEqual(self.m.step(FRAME, float(now))[1], 1.2)
             self.assertEqual(detector.call_count, 2)
+        self.assertEqual(self.m.readable_exit.count, 1)
+        self.assertGreater(self.m.travel, .08)
 
     def test_tentative_oblique_never_releases(self):
         self.rearm()
@@ -810,9 +822,10 @@ class SecondSignPolicyTests(unittest.TestCase):
 
     def test_parking_handover_after_second_confirmation_uses_global_cap(self):
         self.rearm()
-        self.signs.return_value = [sign(size=20)]
+        self.signs.return_value = [sign(size=24)]
         self.assert_capped(6.)
         self.m.step(FRAME, 6.1)
+        self.m.step(FRAME, 6.15)
         self.m.hospital_done = True
         self.m._marker.return_value = np.ones((4, 2), np.float32)
         with patch.object(t.PoseEstimator, 'update', return_value=pose(.8, .2)), \
@@ -822,6 +835,210 @@ class SecondSignPolicyTests(unittest.TestCase):
         self.assertIsNotNone(self.m.parker)
         self.assertEqual(speed, 2.)
         self.assertFalse(self.m.zone_speed_hold)
+
+
+class ReadableExitPolicyTests(unittest.TestCase):
+    setUp = MissionTests.setUp
+    rearm = SecondSignPolicyTests.rearm
+
+    def capped(self, now):
+        steering, speed = self.m.step(FRAME, now)
+        self.assertLessEqual(speed, 1.2)
+        self.assertTrue(np.isfinite(steering))
+        self.assertTrue(self.m.zone_speed_hold)
+        return speed
+
+    def test_clear_face_filter_boundaries_and_mirrors(self):
+        cases = [(24, 24, 576, True), (24, 32, 768, True),
+                 (32, 24, 768, False), (31, 24, 744, True),
+                 (23, 24, 552, False), (24, 23, 552, False),
+                 (24, 33, 792, False), (33, 24, 792, False),
+                 (40, 40, 399, False)]
+        for x in (20, 580):
+            for width, height, area, eligible in cases:
+                with self.subTest(x=x, width=width, height=height, area=area):
+                    self.m = mission()
+                    self.rearm()
+                    self.signs.return_value = [dict(label='Speed40',
+                        bbox=(x, 39, width, height), area=area)]
+                    self.capped(6.)
+                    self.capped(6.1)
+                    speed = self.m.step(FRAME, 6.2)[1]
+                    self.assertEqual(self.m.readable_exit.count == 2, eligible)
+                    self.assertEqual(speed > 1.2, eligible)
+                    self.assertLessEqual(speed, t.SPEED_LIMIT)
+
+    def test_small_first_caps_but_never_activates_readable_verifier(self):
+        self.signs.return_value = [sign(size=16)]
+        for now in (0., .1, .2):
+            self.capped(now)
+            self.assertEqual(self.m.speed40.count, 1)
+            self.assertEqual(self.m.readable_exit.count, 0)
+
+    def test_first_readable_count_is_updated_once_per_frame(self):
+        self.signs.return_value = [sign(size=80)]
+        self.capped(0.)
+        self.assertEqual(self.m.readable_exit.count, 1)
+        self.assertEqual(self.m.readable_exit.streak, 0)
+        self.assertEqual(self.m.readable_exit.last_seen, 0.)
+        self.assertTrue(any('readable Speed40 verifier activated' in c.args[1]
+                            for c in self.m.note.call_args_list))
+
+    def test_near_first_and_absence_travel_required_independently(self):
+        for size in (24, 80):
+            with self.subTest(size=size):
+                self.m = mission()
+                self.signs.return_value = [sign(size=size)]
+                self.capped(0.)
+                self.signs.return_value = []
+                with patch.object(self.m, '_hospital', return_value=(0., 0.)):
+                    self.m.last_speed = 0.
+                    for now in np.arange(.1, 6., .1):
+                        self.capped(float(now))
+                self.assertFalse(self.m.readable_exit.rearmed)
+                self.signs.return_value = [sign(size=24)]
+                for now in (6., 6.1, 6.2):
+                    self.capped(now)
+
+    def test_readable_first_never_near_cannot_rearm_despite_travel(self):
+        self.signs.return_value = [sign(size=24)]
+        self.capped(0.)
+        self.signs.return_value = []
+        for now in np.arange(.1, 10., .1):
+            self.capped(float(now))
+        self.assertGreater(self.m.travel, .08)
+        self.assertFalse(self.m.readable_exit.rearmed)
+        self.signs.return_value = [sign(size=24)]
+        for now in (10., 10.1, 10.2):
+            self.capped(now)
+        self.assertEqual(self.m.readable_exit.count, 1)
+
+    def test_same_first_readable_reacquired_cannot_release(self):
+        self.rearm()
+        self.assertTrue(self.m.readable_exit.rearmed)
+        self.signs.return_value = [sign(size=80)]
+        for now in (6., 6.1, 6.2, 6.3):
+            self.capped(now)
+        self.assertEqual(self.m.readable_exit.count, 1)
+        self.assertFalse(self.m.readable_exit.rearmed)
+
+    def test_alternating_readable_objects_cannot_confirm(self):
+        self.rearm()
+        for i, now in enumerate(np.arange(6., 8., .1)):
+            self.signs.return_value = [dict(sign(size=24),
+                bbox=(100 if i % 2 else 500, 39, 24, 24))]
+            self.capped(float(now))
+        self.assertEqual(self.m.readable_exit.streak, 1)
+
+    def test_multiple_mixed_normals_and_weak_duplicate_do_not_filter_to_unique(self):
+        for size in (16, 24):
+            with self.subTest(size=size):
+                self.m = mission()
+                self.rearm()
+                self.signs.return_value = [sign(size=24)]
+                self.capped(6.)
+                self.assertEqual(self.m.readable_exit.streak, 1)
+                self.signs.return_value.append(dict(sign(size=size), bbox=(100, 39, size, size)))
+                with patch.object(t, '_oblique_speed40_candidates', return_value=[sign(size=24)]):
+                    for now in (6.1, 6.2, 6.3):
+                        self.capped(now)
+                self.assertEqual(self.m.readable_exit.streak, 0)
+                self.assertEqual(self.m.readable_exit.count, 1)
+                self.assertEqual(self.m.speed40.count, 1)
+
+    def test_multiple_initial_mixed_normals_do_not_suppress_entry(self):
+        for size in (16, 24):
+            self.m = mission()
+            self.signs.return_value = [sign(size=24), dict(sign(size=size), bbox=(100, 39, size, size))]
+            self.capped(0.)
+            self.assertTrue(self.m.zone)
+            self.assertEqual(self.m.speed40.count, 1)
+            self.assertEqual(self.m.readable_exit.count, 0)
+
+    def test_invalid_pause_repeat_and_long_gap_break_readable_identity(self):
+        for kind in ('missing', 'pause', 'repeat', 'long'):
+            with self.subTest(kind=kind):
+                self.m = mission()
+                self.rearm()
+                self.signs.return_value = [sign(size=24)]
+                self.capped(6.)
+                self.capped(6.1)
+                self.assertEqual(self.m.readable_exit.streak, 2)
+                if kind == 'missing':
+                    self.assertEqual(self.m.step(None, 6.2), (0., 0.))
+                    now = 6.3
+                elif kind == 'pause':
+                    self.m.invalidate_observations()
+                    now = 6.2
+                else:
+                    now = 6.1 if kind == 'repeat' else 7.1
+                self.capped(now)
+                self.assertLessEqual(self.m.readable_exit.streak, 1)
+                self.assertEqual(self.m.readable_exit.count, 1)
+
+    def test_oblique_never_feeds_readable_even_when_frontal_size(self):
+        for strong in (False, True):
+            with self.subTest(strong=strong):
+                self.m = mission()
+                self.rearm()
+                with patch.object(t, '_oblique_speed40_candidates',
+                                  return_value=[dict(sign(size=24), strong=strong)]):
+                    for now in (6., 6.1, 6.2, 6.3):
+                        self.capped(now)
+                self.assertEqual(self.m.readable_exit.count, 1)
+                self.assertEqual(self.m.readable_exit.streak, 0)
+
+    def test_readable_perception_continues_after_weak_route_completion(self):
+        self.rearm()
+        with patch.object(t, '_oblique_speed40_candidates', return_value=[sign(size=24)]) as weak:
+            self.capped(6.)
+            self.capped(6.1)
+            self.assertTrue(self.m.zone_done)
+            self.signs.return_value = [sign(size=24)]
+            self.capped(6.2)
+            self.capped(6.3)
+            self.assertGreater(self.m.step(FRAME, 6.4)[1], 1.2)
+            self.assertEqual(weak.call_count, 2)
+        self.assertEqual(self.m.readable_exit.count, 2)
+
+    def test_weak_exit_missing_readable_uses_original_parking_fallback(self):
+        self.rearm()
+        with patch.object(t, '_oblique_speed40_candidates', return_value=[sign(size=24)]):
+            self.capped(6.)
+            self.capped(6.1)
+        self.m.hospital_done = True
+        self.m._marker.return_value = np.ones((4, 2), np.float32)
+        with patch.object(t.PoseEstimator, 'update', return_value=pose(.8, .2)), \
+                patch.object(self.m, '_drive_parking', return_value=(0., 2.)):
+            self.capped(6.2)
+            self.capped(6.3)
+            self.assertEqual(self.m.step(FRAME, 6.4)[1], 2.)
+        self.assertIsNotNone(self.m.parker)
+        self.assertFalse(self.m.zone_speed_hold)
+        self.assertIn('zone cap released for parking', [c.args[1] for c in self.m.note.call_args_list])
+        self.assertEqual(self.m.readable_exit.count, 1)
+
+    def test_parking_shortcut_cannot_bypass_unverified_hold(self):
+        self.m.zone_done = True
+        self.m.zone_speed_hold = True
+        self.m.parker = Mock()
+        self.m._park = Mock(return_value=(0., 3.))
+        self.capped(0.)
+        self.signs.assert_called_once()
+
+    def test_rejection_logging_is_verbose_and_changes_only(self):
+        self.rearm()
+        self.m.note.reset_mock()
+        with patch.object(t, 'VERBOSE', False):
+            self.signs.return_value = [sign(size=16)]
+            self.capped(6.)
+        self.assertFalse(self.m.note.called)
+        self.m.readable_rejection = None
+        with patch.object(t, 'VERBOSE', True):
+            self.capped(6.1)
+            self.capped(6.2)
+        reasons = [c.args[1] for c in self.m.note.call_args_list if 'readable Speed40 rejected' in c.args[1]]
+        self.assertEqual(reasons, ['readable Speed40 rejected: normal face too small'])
 
 
 class ParkerTests(unittest.TestCase):
@@ -1502,7 +1719,7 @@ class RuntimeTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(t.main(), 1)
         lines = output.getvalue().splitlines()
-        self.assertIn('Task 3 TEST v2', lines[0])
+        self.assertIn('Task 3 TEST v3', lines[0])
         self.assertEqual(lines[1], 'Running source: %s' % SOURCE.resolve())
         self.assertEqual(lines[2], 'Source SHA256: %s' % hashlib.sha256(SOURCE.read_bytes()).hexdigest())
         self.assertIn('offline', lines[3])

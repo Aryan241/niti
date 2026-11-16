@@ -1273,10 +1273,12 @@ class Mission:
         self.previous_centre = None
         self.zone = False                # inside the Speed 40 zone
         self.zone_done = False
-        # Compatibility flag: first sight latches it, confirmed second sight clears
-        # it immediately. The active-zone cap still protects unconfirmed fallback.
+        # Route progress alone cannot release this hold. Only the independent
+        # readable verifier or the original parking handover may clear it.
         self.zone_speed_hold = False
         self.speed40 = SignTracker(ZONE_NEAR_RANGE)
+        self.readable_exit = SignTracker(ZONE_NEAR_RANGE, frames_needed=3)
+        self.readable_rejection = None
         self.weak_exit = WeakBoardTracker()
         self.hospital_done = False
         self.hospital_armed = False      # a Hospital sign seen far away and approaching
@@ -1326,6 +1328,8 @@ class Mission:
             self.weak_exit.reset()
             self.speed40.encounter.reset()
             self.speed40.streak = 0
+            self.readable_exit.encounter.reset()
+            self.readable_exit.streak = 0
         self.frame_travel = self.last_speed * WHEEL_RADIUS * dt
         self.travel += self.frame_travel
         if self.last_now is not None and now > self.last_now:
@@ -1364,20 +1368,22 @@ class Mission:
         self.speed40.rearmed = False
         self.speed40.unseen_travel = 0.0
         self.weak_exit.reset()
+        self.readable_exit.encounter.reset()
+        self.readable_exit.streak = 0
+        self.readable_exit.rearmed = False
+        self.readable_exit.unseen_travel = 0.0
         self.school_near_frames = 0
         if self.parker is not None:
             self.parker.invalidate()
 
     def _speed_cap(self):
-        '''First sight caps immediately; confirmed distinct second sight releases.'''
+        '''First sight caps immediately; route-only exit retains the speed hold.'''
         return ZONE_CRUISE if (self.zone or self.zone_speed_hold) else CRUISE
 
     def _step(self, frame, now):
-        # Once the Speed 40 zone has ended, route perception is no longer used
-        # during parking. Mission.step validates frames before reaching here;
-        # while the zone is active this shortcut is disabled so its exit sign
-        # remains detectable.
-        if self.parker is not None and not self.zone:
+        # Keep normal perception until readable release or parking fallback.
+        # The final Mission.step cap also protects this parking shortcut.
+        if self.parker is not None and not self.zone and not self.zone_speed_hold:
             return self._park(frame, now)
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         red = _colour_mask(hsv, "red")
@@ -1387,15 +1393,16 @@ class Mission:
         signs = detect_signs(frame, hsv, red_parts, blue_parts)
 
         # ---- Speed 40 zone ----
-        speed40 = [s for s in signs if s["label"] == "Speed40"]
-        normal_speed40 = bool(speed40)
+        normals = [s for s in signs if s["label"] == "Speed40"]
+        speed40 = list(normals)
+        normal_speed40 = bool(normals)
         weak_speed40 = []
         oblique = []
         if self.zone and self.speed40.rearmed:
             oblique = _oblique_speed40_candidates(frame, hsv, red, blue)
             weak_speed40 = self.weak_exit.update(oblique)
             # Both trackers observe the same raw sequence. Spatial confirmation
-            # gates release, while the distinct-encounter tracker still requires
+            # gates route progress, while the distinct-encounter tracker requires
             # two consecutive observations after near approach/travel/absence.
             # Prefer a normal detection for an overlapping image object; retain
             # separate candidates so competing signs cannot confirm an exit.
@@ -1424,12 +1431,12 @@ class Mission:
             elif self.zone:
                 self.zone = False
                 self.zone_done = True
-                self.zone_speed_hold = False
                 evidence = speed40[0]
-                self.note(now, 'second Speed 40 confirmed: cap released; source=%s bbox=%s range=%.3f m count=%d rearmed=%s streak=%d'
+                self.note(now, 'route second Speed40 confirmed; cap retained: readable exit unverified; source=%s bbox=%s range=%.3f m count=%d rearmed=%s streak=%d'
                           % ('normal' if normal_speed40 else 'oblique', evidence['bbox'],
                              estimate_sign_range(evidence['bbox'])[0], self.speed40.count,
                              self.speed40.rearmed, self.speed40.streak))
+        self._observe_readable_exit(normals, now)
         cap = self._speed_cap()
         if self.parker is not None:
             return self._park(frame, now)
@@ -1518,6 +1525,54 @@ class Mission:
         return steering, speed
 
     # ---------------- helpers ----------------
+    def _observe_readable_exit(self, normals, now):
+        tracker = self.readable_exit
+        if tracker.count >= 2:
+            return
+        reason = None
+        if len(normals) > 1:
+            reason = 'multiple normal candidates'
+        elif normals:
+            _, _, width, height = normals[0]['bbox']
+            if width < 24 or height < 24:
+                reason = 'normal face too small'
+            elif not 0.75 <= width / float(height) <= 1.33:
+                reason = 'normal face aspect'
+            elif normals[0]['area'] < 400:
+                reason = 'normal face area'
+        if reason is not None:
+            # Do not filter a competing set into a unique eligible sign, or
+            # mistake an unreadable normal observation for clear-road absence.
+            tracker.encounter.reset()
+            tracker.streak = 0
+            tracker.rearmed = False
+            tracker.unseen_travel = 0.0
+            tracker.last_seen = now
+            if VERBOSE and reason != self.readable_rejection:
+                self.note(now, 'readable Speed40 rejected: ' + reason)
+            self.readable_rejection = reason
+            return
+        if tracker.update(normals, now, self.frame_dt, self.frame_travel):
+            self.readable_rejection = None
+            evidence = normals[0]
+            if tracker.count == 2:
+                self.zone = False
+                self.zone_done = True
+                self.zone_speed_hold = False
+                event = 'readable second Speed40 confirmed: cap released'
+            else:
+                event = 'readable Speed40 verifier activated'
+            self.note(now, '%s; source=normal bbox=%s range=%.3f m streak=%d count=%d rearmed=%s'
+                      % (event, evidence['bbox'], estimate_sign_range(evidence['bbox'])[0],
+                         tracker.streak, tracker.count, tracker.rearmed))
+        else:
+            if normals:
+                reason = ('awaiting three consistent normal observations' if tracker.rearmed
+                          else 'near first encounter / absence-travel rearm unverified')
+                if VERBOSE and reason != self.readable_rejection:
+                    self.note(now, 'readable Speed40 rejected: ' + reason)
+            self.readable_rejection = reason
+
     def _observe_school(self, signs, now):
         if self.school_passed or not (self.hospital_done and (self.zone or self.zone_done)):
             return
@@ -1683,7 +1738,7 @@ def main():
     sim, handles = None, None
     frames = 0
     result = 0
-    print('Task 3 TEST v2: first-sight slowdown; confirmed distinct second-sign release.', flush=True)
+    print('Task 3 TEST v3: first-sight slowdown; readable-only second-sign release.', flush=True)
     source_path = os.path.realpath(__file__)
     print('Running source: %s' % source_path, flush=True)
     try:
