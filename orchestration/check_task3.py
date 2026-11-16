@@ -3,7 +3,7 @@
 Run with python3 orchestration/check_task3.py.
 Set TASK3_SOLUTION to test a saved baseline instead of the working solution.
 Only a missing remote API package is stubbed; this cannot validate simulator I/O.
-Use --benchmark for same-process HEAD/working-source timings and equivalence.
+Use --benchmark for same-process 28d3395/working-source timings and equivalence.
 """
 import ast
 import contextlib
@@ -397,7 +397,6 @@ class MissionTests(unittest.TestCase):
         self.assertFalse(self.m.zone_done)
         self.assertEqual(self.m.speed40.count, 1)
         self.assertLessEqual(speed, t.ZONE_LIMIT)
-        self.assertFalse(self.m.exit_passage.armed)
 
     def test_cap_retained_without_exit_confirmation(self):
         self.signs.return_value = [sign(size=80)]
@@ -408,9 +407,7 @@ class MissionTests(unittest.TestCase):
             self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
         self.assertTrue(self.m.zone)
 
-    def test_distinct_second_sign_releases_zone_but_keeps_the_cap(self):
-        # Historical immediate sighting release incurred a penalty; it did not
-        # establish the evaluator's physical boundary. Sighting alone stays capped.
+    def test_distinct_second_sign_releases_zone_and_cap_immediately(self):
         self.signs.return_value = [sign(size=80)]
         self.m.step(FRAME, 0)
         self.m.step(FRAME, .1)
@@ -418,14 +415,20 @@ class MissionTests(unittest.TestCase):
         for now in np.arange(.2, 6, .1):
             self.m.step(FRAME, float(now))
         self.signs.return_value = [sign(size=20)]
-        self.m.step(FRAME, 6)
+        self.assertLessEqual(self.m.step(FRAME, 6)[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.zone_speed_hold)
         _, speed = self.m.step(FRAME, 6.1)
         self.assertTrue(self.m.zone_done)
         self.assertFalse(self.m.zone)
-        self.assertTrue(self.m.zone_speed_hold)
-        self.assertLessEqual(speed, t.ZONE_LIMIT)
+        self.assertFalse(self.m.zone_speed_hold)
+        self.assertGreater(speed, t.ZONE_LIMIT)
+        self.assertLessEqual(speed, t.SPEED_LIMIT)
+        message = self.m.note.call_args.args[1]
+        for evidence in ('second Speed 40 confirmed: cap released', 'source=normal',
+                         'bbox=', 'range=', 'count=2', 'rearmed=True', 'streak=2'):
+            self.assertIn(evidence, message)
 
-    def test_zone_cap_stays_latched_after_the_exit_sighting(self):
+    def test_released_zone_does_not_recap_without_signs(self):
         self.signs.return_value = [sign(size=80)]
         self.m.step(FRAME, 0)
         self.m.step(FRAME, .1)
@@ -437,18 +440,18 @@ class MissionTests(unittest.TestCase):
         self.m.step(FRAME, 6.1)
         self.signs.return_value = []
         for now in np.arange(6.2, 40, .5):
-            self.assertLessEqual(self.m.step(FRAME, float(now))[1], t.ZONE_LIMIT)
+            self.assertGreater(self.m.step(FRAME, float(now))[1], t.ZONE_LIMIT)
         self.assertTrue(self.m.zone_done)
         self.assertFalse(self.m.zone)
 
-    def test_cap_latch_needs_no_sign_and_survives_an_invalid_frame(self):
-        self.m.zone, self.m.zone_speed_hold = True, True
-        self.assertEqual(self.m.step(None, .5), (0., 0.))
-        self.m.zone = False
-        self.m.zone_done = True
-        for now in (1., 2., 3.):
-            self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
-        self.assertTrue(self.m.zone_speed_hold)
+    def test_invalid_frame_after_confirmed_release_does_not_recap(self):
+        self.test_distinct_second_sign_releases_zone_and_cap_immediately()
+        self.assertEqual(self.m.step(None, 6.2), (0., 0.))
+        self.signs.return_value = []
+        for now in (6.3, 6.4, 6.5):
+            self.assertGreater(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
+        self.assertFalse(self.m.zone_speed_hold)
+        self.assertTrue(self.m.zone_done)
 
     def test_cap_latch_releases_at_the_parking_handover(self):
         self.m.hospital_done, self.m.zone = True, True
@@ -672,228 +675,153 @@ class MissionTests(unittest.TestCase):
         self.m._park = lambda frame, now: self.m._drive_parking(aligned, now)
         self.assertGreater(self.m.step(FRAME, 0)[1], t.ZONE_LIMIT)
 
-class ExitPassageTests(unittest.TestCase):
-    @staticmethod
-    def edge(side=1, size=60, x=None):
-        return dict(label='Speed40', bbox=(580 if side == 1 else 0, 150, size, size),
-                    area=size * size, strong=True) if x is None else dict(
-                        label='Speed40', bbox=(x, 150, size, size), area=size * size, strong=True)
-
-    def ready(self, side=1):
-        tracker = t.ExitPassageTracker()
-        tracker.armed = True
-        events = [tracker.update([self.edge(side)], True, .1, .002) for _ in range(3)]
-        self.assertEqual(events, [None, None, 'candidate'])
-        return tracker
-
-    def test_neither_unarmed_nor_first_sighting_can_release(self):
-        tracker = t.ExitPassageTracker()
-        for _ in range(100):
-            self.assertIsNone(tracker.update([self.edge()], True, .1, .002))
-            self.assertIsNone(tracker.update([], True, .1, .002))
-        self.assertEqual(tracker.frames, 0)
-
-    def test_both_edges_require_range_based_full_clearance_after_loss(self):
-        for side in (-1, 1):
-            tracker = self.ready(side)
-            forward = t.estimate_sign_range(self.edge(side)['bbox'])[0]
-            self.assertAlmostEqual(tracker.required, forward + tracker.CLEARANCE)
-            self.assertGreaterEqual(tracker.CLEARANCE,
-                                    t.WHEELBASE + 2*t.WHEEL_OFFSET + t.CAM_AHEAD + .1)
-            distance = 1.2 * t.WHEEL_RADIUS * .5
-            for _ in range(200):
-                before = tracker.travel
-                event = tracker.update([], False, .5, distance)
-                if event == 'release':
-                    self.assertLess(before, tracker.required)
-                    self.assertGreaterEqual(tracker.travel, tracker.required)
-                    self.assertGreaterEqual(tracker.loss_frames, 2)
-                    break
-                self.assertLess(tracker.travel, tracker.required)
-            else:
-                self.fail('Valid synthetic passage never released')
-            self.assertFalse(tracker.armed)
-
-    def test_candidate_event_waits_for_sufficient_history_at_high_frame_rate(self):
-        tracker = t.ExitPassageTracker()
-        tracker.armed = True
-        events = [tracker.update([self.edge()], True, .05, .001) for _ in range(8)]
-        self.assertEqual(events.count('candidate'), 1)
-        self.assertEqual(events[:4], [None] * 4)
-        self.assertEqual(events[4], 'candidate')
-
-    def test_short_or_fast_history_is_not_edge_passage(self):
-        for count, dt in ((1, .1), (2, .1), (3, .01)):
-            tracker = t.ExitPassageTracker()
-            tracker.armed = True
-            for _ in range(count):
-                tracker.update([self.edge()], True, dt, 0.)
-            for _ in range(100):
-                self.assertIsNone(tracker.update([], False, .5, .01))
-            self.assertEqual(tracker.frames, 0)
-
-    def test_competition_weak_interior_far_and_side_switch_reset_readiness(self):
-        cases = (([self.edge(), self.edge(-1)], True), ([self.edge()], False),
-                 ([self.edge(x=300)], True), ([self.edge(size=20)], True),
-                 ([self.edge(-1)], True), ([self.edge(size=100)], True))
-        for detections, confirmed in cases:
-            tracker = self.ready()
-            tracker.update(detections, confirmed, .1, .002)
-            self.assertLess(tracker.frames, tracker.MIN_FRAMES)
-            for _ in range(100):
-                self.assertIsNone(tracker.update([], False, .5, .01))
-
-    def test_spatial_jump_or_range_jump_cannot_build_history(self):
-        tracker = t.ExitPassageTracker()
-        tracker.armed = True
-        for index in range(20):
-            candidate = self.edge() if index % 2 else self.edge(x=580, size=42)
-            self.assertIsNone(tracker.update([candidate], True, .1, .002))
-        self.assertLess(tracker.frames, tracker.MIN_FRAMES)
-
-    def test_invalid_timing_or_travel_resets_readiness(self):
-        for dt, distance in ((0., 0.), (-.1, 0.), (.76, .01), (float('nan'), 0.),
-                             (.1, float('nan')), (.1, -.01), (.1, 1.)):
-            tracker = self.ready()
-            self.assertIsNone(tracker.update([], False, dt, distance))
-            self.assertEqual(tracker.frames, 0)
-            self.assertTrue(tracker.armed)
-
-    def test_stopped_commands_and_reappearance_cannot_accumulate_clearance(self):
-        tracker = self.ready()
-        for _ in range(100):
-            self.assertIsNone(tracker.update([], False, .5, 0.))
-        self.assertEqual(tracker.travel, 0.)
-        tracker.update([], False, .5, .01)
-        tracker.update([self.edge()], True, .1, .002)
-        self.assertEqual(tracker.travel, 0.)
-        self.assertEqual(tracker.frames, 1)
-        self.assertEqual(tracker.loss_frames, 0)
-
-
-class ExitPassageMissionTests(unittest.TestCase):
+class SecondSignPolicyTests(unittest.TestCase):
     setUp = MissionTests.setUp
 
-    def second_encounter(self):
+    def rearm(self):
         self.signs.return_value = [sign(size=80)]
         self.m.step(FRAME, 0.)
         self.signs.return_value = []
         for now in np.arange(.1, 6., .1):
-            self.m.step(FRAME, float(now))
-        self.signs.return_value = [sign(size=20)]
-        self.m.step(FRAME, 6.)
-        self.m.step(FRAME, 6.1)
-        self.assertTrue(self.m.zone_done)
-        self.assertTrue(self.m.exit_passage.armed)
+            self.assertLessEqual(self.m.step(FRAME, float(now))[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.speed40.rearmed)
+
+    def assert_capped(self, now):
+        self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.zone)
+        self.assertFalse(self.m.zone_done)
         self.assertTrue(self.m.zone_speed_hold)
 
-    def ready(self):
-        self.second_encounter()
-        self.signs.return_value = [ExitPassageTests.edge()]
-        for now in (6.2, 6.3, 6.4):
-            self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
-        self.assertEqual(self.m.exit_passage.frames, 3)
+    def test_multiple_initial_signs_stay_capped_and_count_as_one(self):
+        other = dict(sign(size=24), bbox=(100, 150, 24, 24))
+        self.signs.return_value = [sign(size=16), other]
+        for now in (0., .1, .2):
+            self.assert_capped(now)
+            self.assertEqual(self.m.speed40.count, 1)
+
+    def test_only_one_second_observation_never_releases(self):
+        self.rearm()
+        self.signs.return_value = [sign(size=20)]
+        self.assert_capped(6.)
         self.signs.return_value = []
+        for now in (6.1, 6.2, 7., 10.):
+            self.assert_capped(now)
 
-    def test_complete_release_keeps_cap_until_clearance_and_logs_ranges(self):
-        self.ready()
-        passage = self.m.exit_passage
-        for now in np.arange(6.9, 60., .5):
-            before = passage.travel
-            _, speed = self.m.step(FRAME, float(now))
-            if not self.m.zone_speed_hold:
-                self.assertLess(before, passage.required)
-                self.assertGreaterEqual(passage.travel, passage.required)
-                self.assertGreater(speed, t.ZONE_LIMIT)
-                self.assertLessEqual(speed, t.SPEED_LIMIT)
-                break
-            self.assertLessEqual(speed, t.ZONE_LIMIT)
-        else:
-            self.fail('Full image-anchored synthetic passage did not release')
-        messages = [call.args[1] for call in self.m.note.call_args_list]
-        self.assertTrue(any('experimental exit candidate: image_forward=' in msg for msg in messages))
-        self.assertTrue(any('experimental exit release:' in msg and 'command_travel=' in msg for msg in messages))
-
-    def test_continues_strong_spatial_oblique_observation_after_second_encounter(self):
-        self.second_encounter()
+    def test_disappearance_without_commanded_travel_never_rearms(self):
+        self.signs.return_value = [sign(size=80)]
+        self.m.step(FRAME, 0.)
         self.signs.return_value = []
-        edge = ExitPassageTests.edge()
-        with patch.object(t, '_oblique_speed40_candidates', return_value=[edge]) as detector:
-            for now in (6.2, 6.3, 6.4, 6.5):
-                self.assertLessEqual(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
-        self.assertEqual(detector.call_count, 4)
-        self.assertEqual(self.m.exit_passage.frames, 3)
-        self.assertGreaterEqual(self.m.exit_passage.history + 1e-9, .2)
+        with patch.object(self.m, '_hospital', return_value=(0., 0.)):
+            self.m.last_speed = 0.
+            for now in np.arange(.1, 10., .1):
+                self.assert_capped(float(now))
+        self.assertFalse(self.m.speed40.rearmed)
+        self.signs.return_value = [sign(size=20)]
+        for now in (10., 10.1):
+            self.assert_capped(now)
 
-    def test_normal_and_oblique_competing_objects_cannot_confirm_second(self):
-        self.second_encounter()
-        self.signs.return_value = [ExitPassageTests.edge()]
+    def test_no_near_approach_never_rearms(self):
+        self.signs.return_value = [sign(size=16)]
+        self.m.step(FRAME, 0.)
+        self.signs.return_value = []
+        for now in np.arange(.1, 10., .1):
+            self.assert_capped(float(now))
+        self.assertFalse(self.m.speed40.rearmed)
+
+    def test_spatially_alternating_normal_signs_never_confirm(self):
+        self.rearm()
+        for i, now in enumerate(np.arange(6., 7., .1)):
+            self.signs.return_value = [dict(sign(size=20), bbox=(100 if i % 2 else 500, 150, 20, 20))]
+            self.assert_capped(float(now))
+        self.assertEqual(self.m.speed40.streak, 1)
+
+    def test_competing_normal_signs_never_confirm(self):
+        self.rearm()
+        self.signs.return_value = [sign(size=20), dict(sign(size=20), bbox=(100, 150, 20, 20))]
+        for now in (6., 6.1, 6.2):
+            self.assert_capped(now)
+        self.assertEqual(self.m.speed40.streak, 0)
+
+    def test_competing_normal_and_oblique_signs_never_confirm(self):
+        self.rearm()
+        self.signs.return_value = [sign(size=20)]
+        other = dict(sign(size=20), bbox=(100, 150, 20, 20), strong=True)
+        with patch.object(t, '_oblique_speed40_candidates', return_value=[other]):
+            for now in (6., 6.1, 6.2):
+                self.assert_capped(now)
+        self.assertEqual(self.m.speed40.streak, 0)
+
+    def test_duplicate_normal_and_oblique_confirm_on_second_frame(self):
+        self.rearm()
+        self.signs.return_value = [sign(size=20)]
+        with patch.object(t, '_oblique_speed40_candidates', return_value=[sign(size=20)]):
+            self.assert_capped(6.)
+            self.assertGreater(self.m.step(FRAME, 6.1)[1], t.ZONE_LIMIT)
+        self.assertTrue(self.m.zone_done)
+        self.assertFalse(self.m.zone_speed_hold)
+        self.assertIn('source=normal', self.m.note.call_args.args[1])
+
+    def test_strong_oblique_second_pair_releases_and_stops_exit_perception(self):
+        self.rearm()
+        candidate = dict(sign(size=20), strong=True)
+        with patch.object(t, '_oblique_speed40_candidates', return_value=[candidate]) as detector:
+            self.assert_capped(6.)
+            self.assertGreater(self.m.step(FRAME, 6.1)[1], t.ZONE_LIMIT)
+            self.assertIn('source=oblique', self.m.note.call_args.args[1])
+            self.assertIn('bbox=', self.m.note.call_args.args[1])
+            self.assertIn('range=', self.m.note.call_args.args[1])
+            for now in (6.2, 6.3):
+                self.assertGreater(self.m.step(FRAME, now)[1], t.ZONE_LIMIT)
+            self.assertEqual(detector.call_count, 2)
+
+    def test_tentative_oblique_never_releases(self):
+        self.rearm()
         with patch.object(t, '_oblique_speed40_candidates',
-                          return_value=[ExitPassageTests.edge(-1)]):
-            for now in (6.2, 6.3, 6.4):
-                self.m.step(FRAME, now)
-        self.assertEqual(self.m.exit_passage.frames, 0)
-        tracker = t.SignTracker(t.ZONE_NEAR_RANGE)
-        tracker.update([sign(size=80)], 0.)
-        tracker.rearmed = True
-        for now in (.1, .2, .3):
-            self.assertFalse(tracker.update([sign(size=20), sign(size=25)], now))
-        self.assertEqual(tracker.count, 1)
-        self.assertEqual(tracker.streak, 0)
+                          return_value=[dict(sign(size=20), strong=False)]):
+            for now in (6., 6.1, 6.2, 6.3):
+                self.assert_capped(now)
+        self.assertEqual(self.m.speed40.count, 1)
 
-    def test_duplicate_normal_oblique_object_does_not_look_like_competition(self):
-        self.second_encounter()
-        edge = ExitPassageTests.edge()
-        self.signs.return_value = [edge]
-        with patch.object(t, '_oblique_speed40_candidates', return_value=[edge]):
-            for now in (6.2, 6.3, 6.4):
-                self.m.step(FRAME, now)
-        self.assertEqual(self.m.exit_passage.frames, 3)
+    def test_school_and_absence_never_release(self):
+        self.rearm()
+        self.signs.return_value = [sign('School', size=80)]
+        for now in (6., 6.1, 6.2):
+            self.assert_capped(now)
+        self.signs.return_value = []
+        for now in (7., 8., 9.):
+            self.assert_capped(now)
 
-    def test_invalid_frame_pause_and_timestamp_discontinuities_discard_readiness(self):
-        for kind in ('missing', 'pause', 'repeat', 'long', 'backwards', 'nan'):
+    def test_discontinuous_or_invalid_observations_break_confirmation(self):
+        for kind in ('missing', 'pause', 'repeat', 'long'):
             with self.subTest(kind=kind):
-                # Each independent case uses the normal Mission timestamp path.
                 self.m = mission()
-                self.ready()
+                self.rearm()
+                self.signs.return_value = [sign(size=20)]
+                self.assert_capped(6.)
                 if kind == 'missing':
-                    self.assertEqual(self.m.step(None, 6.5), (0., 0.))
+                    self.m.step(None, 6.1)
+                    now = 6.2
                 elif kind == 'pause':
                     self.m.invalidate_observations()
-                elif kind in ('backwards', 'nan'):
-                    with self.assertRaises(ValueError):
-                        self.m.step(FRAME, 6.3 if kind == 'backwards' else float('nan'))
+                    now = 6.1
                 else:
-                    self.m.step(FRAME, 6.4 if kind == 'repeat' else 7.2)
-                self.assertEqual(self.m.exit_passage.frames, 0)
-                self.assertTrue(self.m.zone_speed_hold)
+                    now = 6. if kind == 'repeat' else 7.
+                self.assert_capped(now)
 
-    def test_clearance_integrates_previous_final_capped_command_variable_dt(self):
-        self.ready()
-        passage = self.m.exit_passage
-        expected = 0.
-        previous = 6.4
-        with patch.object(self.m, '_hospital', return_value=(0., .3)):
-            for now in (6.5, 6.75, 7.15, 7.3):
-                speed_before = self.m.last_speed
-                expected += speed_before * t.WHEEL_RADIUS * (now - previous)
-                _, command = self.m.step(FRAME, now)
-                self.assertAlmostEqual(command, .3)
-                self.assertAlmostEqual(passage.travel, expected)
-                self.assertTrue(self.m.zone_speed_hold)
-                previous = now
-        self.assertLess(expected, t.ZONE_LIMIT * t.WHEEL_RADIUS * (previous - 6.4))
-
-    def test_school_and_absence_never_arm_passage(self):
-        self.m.zone_speed_hold = self.m.zone = True
-        self.signs.return_value = [sign('School', size=80)]
-        self.m.step(FRAME, 0.)
-        self.m.step(FRAME, .1)
-        self.signs.return_value = []
-        for now in np.arange(.2, 10., .2):
-            self.assertLessEqual(self.m.step(FRAME, float(now))[1], t.ZONE_LIMIT)
-        self.assertFalse(self.m.exit_passage.armed)
-        self.assertTrue(self.m.zone_speed_hold)
+    def test_parking_handover_after_second_confirmation_uses_global_cap(self):
+        self.rearm()
+        self.signs.return_value = [sign(size=20)]
+        self.assert_capped(6.)
+        self.m.step(FRAME, 6.1)
+        self.m.hospital_done = True
+        self.m._marker.return_value = np.ones((4, 2), np.float32)
+        with patch.object(t.PoseEstimator, 'update', return_value=pose(.8, .2)), \
+                patch.object(self.m, '_drive_parking', return_value=(0., 2.)):
+            for now in (6.2, 6.3, 6.4):
+                _, speed = self.m.step(FRAME, now)
+        self.assertIsNotNone(self.m.parker)
+        self.assertEqual(speed, 2.)
+        self.assertFalse(self.m.zone_speed_hold)
 
 
 class ParkerTests(unittest.TestCase):
@@ -1333,20 +1261,20 @@ class ParkerTests(unittest.TestCase):
         corners = PoseTests.CORNERS
         with patch.object(estimator, '_bearing', return_value=-.5894), \
              patch.object(estimator, '_pnp', return_value=(.7096, .5522)):
-            poses = [estimator.update(corners, 0.0, .15 * i) for i in range(1, 15)]
+            poses = [estimator.update(corners, 0.0, .15 * i) for i in (1, 2, 3)]
         self.assertFalse(poses[0]['heading_observed'])
         self.assertFalse(poses[1]['heading_observed'])
-        self.assertFalse(poses[2]['heading_observed'])
-        self.assertTrue(poses[-1]['heading_observed'])
-        self.assertLess(abs(poses[-1]['heading'] + .7096),
-                        t.PoseEstimator.YAW_PROOF_RESIDUAL)
+        self.assertTrue(poses[2]['heading_observed'])
+        self.assertLess(abs(poses[2]['heading'] + .7096),
+                        t.PoseEstimator.YAW_GATE)
 
         for i, observed_pose in enumerate(poses):
             _, speed, parked = p.step(observed_pose, .15 * (i + 1))
             self.assertFalse(parked)
-            if not observed_pose['heading_observed']:
+            if i < 2:
                 self.assertEqual(speed, 0.0)
-        self.assertGreater(speed, 0.0)
+            else:
+                self.assertGreater(speed, 0.0)
 
     def test_current_pose_geometry_uses_current_raw_range_with_current_bearing(self):
         estimator = t.PoseEstimator()
@@ -1416,13 +1344,10 @@ class PoseTests(unittest.TestCase):
                 for dt in intervals:
                     now += dt
                     result = estimator.update(self.CORNERS, 0.0, now)
-                    self.assertEqual(result['heading_observed'],
-                        abs(estimator.heading) <= estimator.YAW_PROOF_RESIDUAL)
+                    self.assertTrue(result['heading_observed'])
             endings.append(abs(estimator.heading))
         self.assertLess(max(endings), np.deg2rad(0.1))
-        # The finite per-observation allowance makes capped convergence slightly
-        # frame-rate dependent; all schedules must still remove the bias.
-        self.assertLess(max(endings) - min(endings), np.deg2rad(.05))
+        self.assertLess(max(endings) - min(endings), 1e-10)
 
     def test_command_prediction_integrates_actual_variable_dt_and_both_turn_signs(self):
         for steering in (-.31, .31):
@@ -1479,15 +1404,14 @@ class PoseTests(unittest.TestCase):
                 estimator = t.PoseEstimator()
                 estimator.rho = .60
                 yaw = np.deg2rad(degrees)
-                with patch.object(estimator, '_pnp', return_value=(yaw, .60)):
+                with patch.object(estimator, '_pnp', side_effect=[(yaw, .60)] * 4):
                     poses = [estimator.update(self.CORNERS, 0.0, 1.0 + .1 * i)
-                             for i in range(30)]
-                self.assertFalse(poses[2]['heading_observed'])
+                             for i in range(4)]
                 initial_error = abs(yaw)
                 final_error = abs(yaw + poses[-1]['heading'])
                 self.assertLess(final_error, initial_error)
                 self.assertTrue(poses[-1]['heading_observed'])
-                self.assertLess(final_error, t.PoseEstimator.YAW_PROOF_RESIDUAL)
+                self.assertLess(final_error, t.PoseEstimator.YAW_GATE)
 
     def test_single_discordant_clear_yaw_does_not_reset_heading(self):
         estimator = t.PoseEstimator()
@@ -1516,11 +1440,7 @@ class PoseTests(unittest.TestCase):
         self.assertFalse(ambiguous['heading_observed'])
         self.assertFalse(after_one['heading_observed'])
         self.assertFalse(after_two['heading_observed'])
-        self.assertFalse(after_three['heading_observed'])
-        self.assertEqual(estimator._recovery_count, 3)
-        self.assertGreater(abs(estimator.heading), 0.0)
-        self.assertLessEqual(abs(estimator.heading),
-            estimator.YAW_CORRECTION_RATE * .1 + estimator.YAW_CORRECTION_ALLOWANCE + 1e-9)
+        self.assertTrue(after_three['heading_observed'])
 
     def test_missing_or_invalid_frame_resets_recovery_streak(self):
         for bad_frame in (None, np.array([[1., 1.], [2., 2.], [3., 3.]])):
@@ -1553,83 +1473,6 @@ class PoseTests(unittest.TestCase):
                 self.assertEqual(estimator._recovery_count, 1)
 
 
-class BoundedYawTests(unittest.TestCase):
-    CORNERS = PoseTests.CORNERS
-
-    def test_large_log_residual_cannot_inject_point_three_radian_flip(self):
-        # Log: heading .017 -> .343 in .1 s with only .012 rad bearing change.
-        estimator = t.PoseEstimator()
-        estimator.heading = -.017
-        estimator._last_observation_time = 0.
-        estimator._recovery_yaw = -.56
-        estimator._recovery_count = 2
-        with patch.object(estimator, '_pnp', return_value=(-.56, .90)), \
-             patch.object(estimator, '_bearing', side_effect=(.36, .372)):
-            before = estimator.update(self.CORNERS, 0., .01)
-            after = estimator.update(self.CORNERS, 0., .11)
-        delta = abs(after['heading'] - before['heading'])
-        self.assertLessEqual(delta, estimator.YAW_CORRECTION_RATE * .1 +
-                             estimator.YAW_CORRECTION_ALLOWANCE + 1e-9)
-        self.assertLess(delta, .05)
-        self.assertLess(abs(after['lateral'] - before['lateral']), .06)
-        self.assertFalse(after['heading_observed'])
-        # Geometry remains derived from CURRENT raw range/bearing, not clipped.
-        heading = -after['heading']
-        expected = .9 * np.sin(.372 + heading) - (t.WHEELBASE/2 - t.CAM_AHEAD) * np.sin(heading)
-        self.assertAlmostEqual(after['lateral'], expected)
-
-    def test_normal_and_recovery_corrections_bounded_at_variable_frame_rates(self):
-        for yaw in (.24, -.24, .60, -.60):
-            for dt in (.01, .1, .4):
-                estimator = t.PoseEstimator()
-                with patch.object(estimator, '_pnp', return_value=(yaw, .6)):
-                    before = estimator.update(self.CORNERS, 0., 0.)
-                    for index in range(1, 12):
-                        after = estimator.update(self.CORNERS, 0., index * dt)
-                        self.assertLessEqual(abs(after['heading'] - before['heading']),
-                            estimator.YAW_CORRECTION_RATE * dt + estimator.YAW_CORRECTION_ALLOWANCE + 1e-9)
-                        if after['heading_observed']:
-                            self.assertLessEqual(abs(yaw + after['heading']), estimator.YAW_PROOF_RESIDUAL)
-                        before = after
-
-    def test_no_elapsed_time_invents_no_measurement_correction(self):
-        for now in (None, float('nan'), 1., .9, 2.):
-            estimator = t.PoseEstimator()
-            estimator._last_observation_time = 1.
-            estimator._recovery_yaw = .6
-            estimator._recovery_count = 3
-            with patch.object(estimator, '_pnp', return_value=(.6, .6)):
-                result = estimator.update(self.CORNERS, 0., now)
-            self.assertEqual(result['heading'], 0.)
-            self.assertFalse(result['heading_observed'])
-
-    def test_sustained_yaw_recovers_without_certifying_early_alignment(self):
-        for signum in (-1, 1):
-            estimator = t.PoseEstimator()
-            target = signum * .60
-            with patch.object(estimator, '_pnp', return_value=(target, .6)):
-                poses = [estimator.update(self.CORNERS, 0., i * .1) for i in range(35)]
-            self.assertFalse(poses[2]['heading_observed'])
-            self.assertTrue(poses[-1]['heading_observed'])
-            self.assertLess(abs(target + poses[-1]['heading']), .001)
-            for result in poses:
-                if abs(target + result['heading']) > estimator.YAW_PROOF_RESIDUAL:
-                    self.assertFalse(result['heading_observed'])
-
-    def test_genuine_commanded_turns_remain_tracked_in_both_directions(self):
-        for steering in (-.3, .3):
-            estimator = t.PoseEstimator()
-            estimator._last_observation_time = 0.
-            expected = 0.
-            with patch.object(estimator, '_pnp') as pnp:
-                for i in range(1, 21):
-                    expected -= np.tan(steering) * 1.2 * t.WHEEL_RADIUS * .1 / t.WHEELBASE
-                    pnp.return_value = (expected, .6)
-                    result = estimator.update(self.CORNERS, steering, i * .1, last_speed=1.2)
-                    self.assertAlmostEqual(result['heading'], -expected)
-                    self.assertTrue(result['heading_observed'])
-
-
 class RuntimeTests(unittest.TestCase):
     def fake_sim(self, states):
         sim = Mock()
@@ -1648,8 +1491,27 @@ class RuntimeTests(unittest.TestCase):
         with patch.object(t, 'connect_and_locate', return_value=(sim, HANDLES)), \
              patch.object(t, 'read_frame', reader), patch.object(t.time, 'sleep'), \
              patch.object(t, 'Mission', return_value=m or mission()), \
-             contextlib.redirect_stdout(io.StringIO()):
-            return t.main()
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            result = t.main()
+        self.runtime_output = output.getvalue()
+        return result
+
+    def test_startup_identifies_running_source_before_connecting(self):
+        import hashlib
+        with patch.object(t, 'connect_and_locate', side_effect=RuntimeError('offline')), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(t.main(), 1)
+        lines = output.getvalue().splitlines()
+        self.assertIn('Task 3 TEST v2', lines[0])
+        self.assertEqual(lines[1], 'Running source: %s' % SOURCE.resolve())
+        self.assertEqual(lines[2], 'Source SHA256: %s' % hashlib.sha256(SOURCE.read_bytes()).hexdigest())
+        self.assertIn('offline', lines[3])
+
+    def test_unavailable_source_hash_does_not_prevent_runtime(self):
+        with patch('builtins.open', side_effect=OSError('unreadable')):
+            self.assertEqual(self.run_main(self.fake_sim([17, 0]), Mock(return_value=None)), 0)
+        self.assertIn('Source SHA256: unavailable', self.runtime_output)
+        self.assertNotIn('unreadable', self.runtime_output)
 
     def test_runtime_failure_returns_nonzero_and_stops(self):
         sim = self.fake_sim([17] * 5 + [0])
@@ -1703,7 +1565,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_single_file_imports_and_sim_api_allowlist(self):
         tree = ast.parse(SOURCE.read_text())
-        allowed = {'os', 'sys', 'time', 'cv2', 'numpy', 'coppeliasim_zmqremoteapi_client'}
+        allowed = {'hashlib', 'os', 'sys', 'time', 'cv2', 'numpy', 'coppeliasim_zmqremoteapi_client'}
         sim_apis = {'getObject', 'getSimulationTime', 'getSimulationState', 'handleVisionSensor',
                     'getVisionSensorImg', 'setJointTargetPosition', 'setJointTargetVelocity'}
         for node in ast.walk(tree):
@@ -1773,9 +1635,9 @@ def benchmark():
     import time
 
     baseline_source = subprocess.check_output(
-        ['git', '--no-pager', 'show', 'HEAD:task3/task3.py'], cwd=ROOT).decode()
+        ['git', '--no-pager', 'show', '28d3395:task3/task3.py'], cwd=ROOT).decode()
     baseline = types.ModuleType('task3_timing_baseline')
-    exec(compile(baseline_source, 'HEAD:task3/task3.py', 'exec'), baseline.__dict__)
+    exec(compile(baseline_source, '28d3395:task3/task3.py', 'exec'), baseline.__dict__)
     cv2.setNumThreads(1)
     frames = timing_frames()
     prepared = []
@@ -1791,6 +1653,7 @@ def benchmark():
         multiple += len(expected) > 1
         strong += sum(bool(item['strong']) for item in expected)
         prepared.append((frame, hsv, red, blue))
+    print('Baseline commit: 28d3395 (not HEAD)')
     print('Baseline SHA256:', hashlib.sha256(baseline_source.encode()).hexdigest())
     print('Candidate SHA256:', hashlib.sha256(SOURCE.read_bytes()).hexdigest())
     print('Versions:', sys.version.split()[0], 'OpenCV', cv2.__version__, 'NumPy', np.__version__)

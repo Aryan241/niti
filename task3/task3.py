@@ -27,6 +27,7 @@
 
 
 ####################### IMPORT MODULES #######################
+import hashlib
 import os
 import sys
 import time
@@ -720,11 +721,6 @@ class PoseEstimator:
     YAW_RECOVERY_FLOOR = np.deg2rad(2.0)
     YAW_RECOVERY_MAX_GAP = 0.75
     YAW_RECOVERY_BLEND = 0.60
-    # Measurement correction is separate from commanded turn prediction. Even
-    # confirmed PnP recovery must not inject a discontinuous lateral/yaw jump.
-    YAW_CORRECTION_RATE = np.deg2rad(20.0)  # rad/s, normal AND recovery
-    YAW_CORRECTION_ALLOWANCE = np.deg2rad(0.5)
-    YAW_PROOF_RESIDUAL = np.deg2rad(3.0)
 
     def __init__(self):
         self.heading = 0.0
@@ -769,9 +765,10 @@ class PoseEstimator:
         return (sols[0][1] if clear else None), rho
 
     def update(self, corners, last_steering, now=None, last_speed=0.0):
-        # Neither fusion nor prediction invents elapsed time across a first,
-        # missing, repeated, backwards or excessively separated timestamp.
-        blend_dt = 0.0
+        # Keep image-fusion timing separate from motion-prediction timing. The
+        # fallback interval preserves the existing blend behavior, but cannot
+        # invent travel when this observation has no valid elapsed time.
+        blend_dt = 0.15
         prediction_dt = 0.0
         try:
             observation_time = None if now is None else float(now)
@@ -848,14 +845,8 @@ class PoseEstimator:
             if abs(yaw_residual) < self.YAW_GATE:
                 self._reset_yaw_recovery()
                 normal_blend = 1.0 - np.exp(-blend_dt / self.YAW_NORMAL_TAU)
-                requested_correction = normal_blend * yaw_residual
-                correction_limit = (self.YAW_CORRECTION_RATE * blend_dt +
-                                    self.YAW_CORRECTION_ALLOWANCE) if blend_dt > 0 else 0.0
-                self.heading += float(np.clip(requested_correction,
-                                              -correction_limit, correction_limit))
-                heading_observed = abs(float(np.arctan2(
-                    np.sin(yaw_seen - self.heading),
-                    np.cos(yaw_seen - self.heading)))) <= self.YAW_PROOF_RESIDUAL
+                self.heading += normal_blend * yaw_residual
+                heading_observed = True
             else:
                 if self._recovery_yaw is None:
                     self._recovery_yaw, self._recovery_count = yaw_seen, 1
@@ -871,13 +862,10 @@ class PoseEstimator:
                     else:
                         self._recovery_yaw, self._recovery_count = yaw_seen, 1
                 if self._recovery_count >= self.YAW_RECOVERY_FRAMES:
-                    correction_limit = (self.YAW_CORRECTION_RATE * blend_dt +
-                                        self.YAW_CORRECTION_ALLOWANCE) if blend_dt > 0 else 0.0
-                    self.heading += float(np.clip(self.YAW_RECOVERY_BLEND * yaw_residual,
-                                                  -correction_limit, correction_limit))
+                    self.heading += self.YAW_RECOVERY_BLEND * yaw_residual
                     heading_observed = abs(float(np.arctan2(
                         np.sin(yaw_seen - self.heading),
-                        np.cos(yaw_seen - self.heading)))) <= self.YAW_PROOF_RESIDUAL
+                        np.cos(yaw_seen - self.heading)))) < self.YAW_GATE
         los = bearing + self.heading
         # Current-frame raw range pairs with current-frame bearing. Keep the
         # filtered range only for odometry; do not let its lag certify parking.
@@ -1222,7 +1210,7 @@ class SignTracker:
     '''Enter on first sight; release only after a distinct subsequent encounter.
 
     Require a near approach, sustained absence with commanded travel, and a
-    new farther-away sign confirmed in consecutive frames. Absence alone, or
+    new farther-away sign spatially confirmed in consecutive frames. Absence alone, or
     reacquiring the same near sign, never releases the conservative zone cap.
     Commanded travel is supporting evidence, not measured vehicle motion.
     '''
@@ -1237,10 +1225,12 @@ class SignTracker:
         self.unseen_travel = 0.0
         self.rearmed = False
         self.count = 0
+        self.encounter = WeakBoardTracker()
 
     def update(self, detections, now, frame_dt=0.0, travel=0.0, confirmed=True):
         # Competing signs block exit confirmation, never first-sight entry.
         if self.count > 0 and len(detections) > 1:
+            self.encounter.reset()
             self.streak = 0
             return False
         ranges = [estimate_sign_range(d["bbox"])[0] for d in detections]
@@ -1249,6 +1239,7 @@ class SignTracker:
         if self.count >= 2:
             return False
         if nearest is None:
+            self.encounter.reset()
             self.streak = 0
             self.unseen_travel += max(travel, 0.0)
             if (self.count == 1 and self.nearest <= self.near_range and
@@ -1263,7 +1254,8 @@ class SignTracker:
             self.nearest = nearest
             return True
         distinct = self.rearmed and nearest >= self.nearest + 0.15
-        self.streak = self.streak + 1 if distinct else 0
+        self.encounter.update(detections if distinct else [])
+        self.streak = self.encounter.streak if distinct else 0
         if not distinct:
             self.rearmed = False
             self.nearest = min(self.nearest, nearest)
@@ -1271,86 +1263,6 @@ class SignTracker:
             self.count = 2
             return True
         return False
-
-
-class ExitPassageTracker:
-    '''Experimental image-anchored clearance, NOT physical/official zone proof.
-
-    Arm only after SignTracker's distinct second encounter. Commanded wheel
-    travel supports edge-loss evidence; slip, curves and evaluator geometry
-    remain unknown. Insufficient/ambiguous evidence leaves the cap latched.
-    '''
-
-    MAX_GAP = 0.75
-    NEAR_RANGE = 0.65
-    EDGE_FRACTION = 0.12
-    MIN_FRAMES = 3
-    MIN_HISTORY = 0.20
-    # Deliberately overcounts camera offset even though sign range is centre-
-    # referenced: full wheelbase/overhang envelope plus camera and noise margin.
-    CLEARANCE = WHEELBASE + 2 * WHEEL_OFFSET + CAM_AHEAD + 0.10
-
-    def __init__(self):
-        self.armed = False
-        self.reset()
-
-    def reset(self):
-        self.bbox = None
-        self.side = None
-        self.frames = 0
-        self.history = 0.0
-        self.last_range = None
-        self.required = None
-        self.travel = 0.0
-        self.loss_frames = 0
-
-    def update(self, detections, confirmed, dt, travel):
-        if not self.armed:
-            return None
-        if not (np.isfinite(dt) and 0 < dt <= self.MAX_GAP and
-                np.isfinite(travel) and 0 <= travel <= SPEED_LIMIT * WHEEL_RADIUS * dt + 1e-9):
-            self.reset()
-            return None
-        if not detections:
-            if self.frames < self.MIN_FRAMES or self.history + 1e-9 < self.MIN_HISTORY:
-                self.reset()
-                return None
-            self.loss_frames += 1
-            self.travel += travel
-            if self.loss_frames >= 2 and self.travel >= self.required:
-                self.armed = False
-                return 'release'
-            return None
-        # A weak, competing or returning observation cannot masquerade as loss.
-        if len(detections) != 1 or not confirmed:
-            self.reset()
-            return None
-        was_ready = self.frames >= self.MIN_FRAMES and self.history + 1e-9 >= self.MIN_HISTORY
-        box = detections[0]['bbox']
-        x, y, w, h = box
-        forward, lateral = estimate_sign_range(box)
-        cx = x + w / 2.0
-        side = -1 if cx <= IMG_W * self.EDGE_FRACTION else (
-            1 if cx >= IMG_W * (1.0 - self.EDGE_FRACTION) else None)
-        if (side is None or not np.isfinite(forward) or not np.isfinite(lateral) or
-                not 0 < forward <= self.NEAR_RANGE or w <= 0 or h <= 0):
-            self.reset()
-            return None
-        consistent = False
-        if self.bbox is not None and not self.loss_frames and side == self.side:
-            px, py, pw, ph = self.bbox
-            consistent = (np.hypot(cx - (px + pw / 2.0), y + h / 2.0 - (py + ph / 2.0)) <= 28 and
-                          0.75 <= h / ph <= 1.33 and 0.75 <= w / pw <= 1.33 and
-                          abs(forward - self.last_range) <= 0.06)
-        if not consistent:
-            self.reset()
-        self.frames += 1
-        self.history += dt if consistent else 0.0
-        self.bbox, self.side, self.last_range = box, side, forward
-        self.required = forward + self.CLEARANCE
-        if not was_ready and self.frames >= self.MIN_FRAMES and self.history + 1e-9 >= self.MIN_HISTORY:
-            return 'candidate'
-        return None
 
 
 class Mission:
@@ -1361,14 +1273,11 @@ class Mission:
         self.previous_centre = None
         self.zone = False                # inside the Speed 40 zone
         self.zone_done = False
-        # Historical immediate exit-sighting release incurred a speed penalty.
-        # This candidate retains the hold until conservative edge-loss/clearance
-        # evidence, or the unchanged parking hand-over fallback. Neither visual
-        # passage nor commanded travel proves official evaluator-zone clearance.
+        # Compatibility flag: first sight latches it, confirmed second sight clears
+        # it immediately. The active-zone cap still protects unconfirmed fallback.
         self.zone_speed_hold = False
         self.speed40 = SignTracker(ZONE_NEAR_RANGE)
         self.weak_exit = WeakBoardTracker()
-        self.exit_passage = ExitPassageTracker()
         self.hospital_done = False
         self.hospital_armed = False      # a Hospital sign seen far away and approaching
         self.hospital_streak = 0
@@ -1410,13 +1319,13 @@ class Mission:
     # ---------------- per frame ----------------
     def step(self, frame, now):
         if not np.isfinite(now) or (self.last_now is not None and now < self.last_now):
-            self.exit_passage.reset()
             raise ValueError('Invalid or decreasing simulation time')
         dt = 0.0 if self.last_now is None else now - self.last_now
-        self.observation_dt = dt
-        if not 0 < dt <= ExitPassageTracker.MAX_GAP:
-            self.exit_passage.reset()
+        if not 0 < dt <= 0.75:
+            # Discontinuous observations cannot support consecutive sign identity.
             self.weak_exit.reset()
+            self.speed40.encounter.reset()
+            self.speed40.streak = 0
         self.frame_travel = self.last_speed * WHEEL_RADIUS * dt
         self.travel += self.frame_travel
         if self.last_now is not None and now > self.last_now:
@@ -1451,21 +1360,16 @@ class Mission:
         self.hospital_streak = 0
         self.last_steering = self.last_speed = 0.0
         self.speed40.streak = 0
+        self.speed40.encounter.reset()
         self.speed40.rearmed = False
         self.speed40.unseen_travel = 0.0
         self.weak_exit.reset()
-        self.exit_passage.reset()
         self.school_near_frames = 0
         if self.parker is not None:
             self.parker.invalidate()
 
     def _speed_cap(self):
-        '''Global cap, tightened to the zone limit while inside the zone.
-
-        Exit sighting alone cannot release it. The experimental passage tracker
-        may release the hold after edge loss plus conservative command clearance;
-        absent that evidence the original parking fallback remains.
-        '''
+        '''First sight caps immediately; confirmed distinct second sight releases.'''
         return ZONE_CRUISE if (self.zone or self.zone_speed_hold) else CRUISE
 
     def _step(self, frame, now):
@@ -1487,7 +1391,7 @@ class Mission:
         normal_speed40 = bool(speed40)
         weak_speed40 = []
         oblique = []
-        if (self.zone and self.speed40.rearmed) or (self.zone_done and self.zone_speed_hold):
+        if self.zone and self.speed40.rearmed:
             oblique = _oblique_speed40_candidates(frame, hsv, red, blue)
             weak_speed40 = self.weak_exit.update(oblique)
             # Both trackers observe the same raw sequence. Spatial confirmation
@@ -1520,18 +1424,12 @@ class Mission:
             elif self.zone:
                 self.zone = False
                 self.zone_done = True
-                self.exit_passage.armed = True
-                self.exit_passage.reset()
-                self.note(now, 'second Speed 40 encounter: route exit; cap held pending experimental clearance')
-        if self.zone_done and self.zone_speed_hold:
-            event = self.exit_passage.update(speed40, normal_speed40 or bool(weak_speed40),
-                                             self.observation_dt, self.frame_travel)
-            if event is not None:
-                passage = self.exit_passage
-                self.note(now, 'experimental exit %s: image_forward=%.3f m required=%.3f m command_travel=%.3f m'
-                          % (event, passage.last_range, passage.required, passage.travel))
-                if event == 'release':
-                    self.zone_speed_hold = False
+                self.zone_speed_hold = False
+                evidence = speed40[0]
+                self.note(now, 'second Speed 40 confirmed: cap released; source=%s bbox=%s range=%.3f m count=%d rearmed=%s streak=%d'
+                          % ('normal' if normal_speed40 else 'oblique', evidence['bbox'],
+                             estimate_sign_range(evidence['bbox'])[0], self.speed40.count,
+                             self.speed40.rearmed, self.speed40.streak))
         cap = self._speed_cap()
         if self.parker is not None:
             return self._park(frame, now)
@@ -1785,12 +1683,19 @@ def main():
     sim, handles = None, None
     frames = 0
     result = 0
+    print('Task 3 TEST v2: first-sight slowdown; confirmed distinct second-sign release.', flush=True)
+    source_path = os.path.realpath(__file__)
+    print('Running source: %s' % source_path, flush=True)
+    try:
+        with open(source_path, 'rb') as source:
+            print('Source SHA256: %s' % hashlib.sha256(source.read()).hexdigest(), flush=True)
+    except OSError:
+        print('Source SHA256: unavailable (source could not be read)', flush=True)
     try:
         sim, handles = connect_and_locate()
         deadline = time.monotonic() + 120.0
         mission = Mission()
         started = False
-        print('Task 3 EXPERIMENTAL timing candidate v1: image-edge command clearance; bounded yaw fusion. Not zone-compliance proof.', flush=True)
         print('Waiting for the simulation to run - Task 3 lap.', flush=True)
         advancing = {sim.simulation_advancing_firstafterstop, sim.simulation_advancing_running,
                      sim.simulation_advancing_firstafterpause}
