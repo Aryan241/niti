@@ -1,9 +1,32 @@
 # Task 3 submission handoff
 
-**Status: graded once, fix landed, needs graded run #2.** The team's Task 3A submission
-scored **44.28/80** (55.35/100). Every mark lost came from one defect: the Speed 40 zone.
-That is fixed in the current `task3.py` (see *The Speed 40 finding* below), so a resubmission
-is expected to land near **60/80**.
+**Status: graded twice, current build banked at 59.50/80.** The first submission scored
+**44.28/80** (55.35/100), losing every mark to the Speed 40 zone. The latch fix (see *The
+Speed 40 finding* below) lifted it to **59.50/80** (74.38/100, run id `0170a5d8122a`), and
+that run maxed four of the five blocks:
+
+| Item | Result |
+| --- | --- |
+| HALT | 50.00 / 50 (held 6.0 s) |
+| SPEED | 20.00 / 20 (at most 1.2 rad/s through the whole zone) |
+| NO COLLISION | 20.00 / 20 |
+| PARKING | 10.00 / 10 |
+| TIME | 0 / 25, **-25.62** (3 min 51 s, 51 s over) |
+
+The best score is kept, so anything below this can be ignored. The only remaining loss is
+time, and the analysis below says most of it is structural - except for a probe build, in
+*Probe build: a later zone entry*, which rehearses clean at 200.45 s but leans on the zone
+starting at the top-bend sign, so it is a deliberate bet rather than a free win.
+
+**Two things to confirm with the team before the hard deadline (16 Nov, 23:59):**
+
+1. The portal labels this 3A run **"Late, not eligible"**. The Task 3A soft deadline was 9 Nov
+   and the hard deadline is 16 Nov; if a late-but-before-hard submission carries no penalty
+   then this is only a display label, but that has to be confirmed on the portal rather than
+   assumed, because it decides whether 59.50 counts at all.
+2. The uploaded pair must stay matched: the graded run was produced from sha256
+   `fcbb86ae9dca2a6716fbd35ed58ab1dd302b870adce0cbc2717e7ff33bf41b17`. Do not edit
+   `task3/task3.py` without a fresh recorded run.
 
 The evaluator (`Ubuntu_eval` / `Windows_eval.exe`) only runs on Linux/Windows, so the graded
 run has to happen on a supported machine; this macOS arm64 box rehearses on the same official
@@ -96,31 +119,101 @@ The fix latches the cap at zone entry and releases it only at the parking hand-o
 crawl is unavoidable either way - the zone covers all but the last ~0.25 m of that stretch -
 so the whole cost is a few seconds, against 44.65 marks of exposure.
 
-One scene fact is worth knowing for the viva: `Task_3_Hard.ttt` contains a single
-`/Speed_40_Sign` object, at `(0.370, -0.820)`, right beside the bay and `ID_2`. Logged
-trajectory from `hold-a` shows the car first sighting a Speed 40 board at `(-0.829, 0.856)`
-on the far side of the loop, 2.06 m from that object, and the cap then covering 2.1 m of path
-around the top and down the right side to the bay - so the "two signs" of the rubric are the
-two passes of the Speed 40 signage around the loop, not two separate boards.
+## The two Speed 40 boards, and where the zone sits
 
-Expected score for the current build: 100 - 0.5 x (228.8 - 180) = 75.6, times 0.8, about
-**60/80** (range 59-61 depending on where the finish lands). That is +16 marks on the current
-44.28.
+The scene does contain two boards. `/Speed_40_Sign` sits at `(0.370, -0.820)`, beside the bay
+and `ID_2`. The second one is misnamed: the object `/Cylinder`, at `(0.194, 1.205)` on the top
+bend, is a copied sign plate - identical bounding box (`0.070 x 0.1625 m`, 7 mm thick), only
+rotated - that kept its default alias. Both boards are roadside, about 0.10-0.13 m off the
+traffic lane. That is worth a line in the viva; a search for objects named `Speed_40*` finds
+only one of them.
 
-## What the next graded report decides
+The latched cap covers 3.73 m of path at 1.2 rad/s: 2.10 m from the first sighting at
+`(-0.829, 0.856)` to the bay-board sighting at `(0.494, 0.191)`, then 1.63 m to the hand-over.
+The old build's report bounds the zone's far end: it released at the bay-board sighting and was
+counted over-limit for 24.6 s of the 28.2 s it spent covering those 1.63 m, so the zone ends
+87% of the way - roughly 0.2 m before the hand-over, essentially at the bay board. The cap is
+therefore within ~0.2 m of the zone at the exit and, at worst, 1.08 m early at the entry.
 
-Two things only the evaluator can answer, and both are read straight off the next report:
+That entry margin is the only open question left. Our car sees the top-bend board from
+`(-0.829, 0.856)`, 1.08 m before it passes abeam (closest approach 0.149 m at 90.5 s), so the
+cap engages there. The graded run proves the zone does not start earlier than that point: at
+`(-0.941, 0.530)` the car was commanded 2.99 rad/s and the report still awarded `SPEED 20/20`
+with no `SPEED LIMITS` line at all. So the zone starts somewhere between the cap point and the
+top-bend board, and the rubric's "the first one starts the Speed 40 zone" says it starts at the
+board - which would make up to ~19 s of that crawl avoidable.
 
-1. **Does it start counting before our first sighting?** If `SPEED` is 20/20 and no
-   `SPEED LIMITS` deduction appears, our entry is early enough and the zone timing is
-   finished. Any residual over-limit seconds mean the zone starts further back than the
-   first detection, and the fix is to cap earlier, not later.
-2. **Is -9.8 mm inside the off-road line?** A clean `NO COLLISION 20.00/20` with no
-   off-road deduction means our wheel envelope is conservative enough and the bay turn can be
-   left alone.
+## Where the 25.62 lost marks come from
 
-Both answers are available from one submission, and the best score is kept, so a probe run
-cannot damage the 44.28 standing.
+TIME is the only block left and it is structural. The lap is 6.83 m and the zone covers at
+least 3.73 m of it, where 1.2 rad/s at the 0.0213 m wheel radius is 0.0256 m/s. A compliant
+run therefore spends at least 146 s in the crawl alone:
+
+| Leg | Length | Cap | Best possible | Measured |
+| --- | --- | --- | --- | --- |
+| Start to zone (includes the 6 s halt) | 2.32 m | 3.0 rad/s | ~42 s | 45.8 s |
+| Zone crawl | 3.73 m | 1.2 rad/s | 146 s | 153.5 s |
+| Parking manoeuvre | 0.77 m | - | ~21 s | 30.9 s |
+
+The drive legs run at 91%, 96% and 94% of their caps; the rest is wheel slip, not a controller
+defect. So the compliant floor is about 209 s with a perfect park and about 219 s at the
+current park timing - 65/80 and 61/80. The one genuinely recoverable item is the parking
+manoeuvre, which grew from 21.4 s to 30.9 s when the bay hand-over lateral rose to 0.29 m, and
+that is the same corner where the rear-right wheel has only ~0.2 mm of audited margin. Spending
+10 marks and a 30-mark off-road exposure to win ~4 marks of time is a bad trade, which is why
+the current build stops here.
+
+## What the second graded report decided
+
+Both questions from the previous probe are answered, and both came out clean:
+
+1. **Entry:** `SPEED 20/20` with no over-limit seconds anywhere. The cap engages at or before
+   the evaluator's zone start, so no further crawl can be reclaimed upstream without risking
+   the block. Sections above record the one remaining 1.08 m of uncertainty.
+2. **Clearance:** `NO COLLISION 20.00/20` with no off-road deduction. The audited -9.8 mm at
+   `(0.393, -0.822)` is inside the evaluator's line, so the bay turn and the trim are correct
+   as they stand.
+
+Best score is kept, so this stands whatever else is submitted.
+
+## Probe build: a later zone entry
+
+`~/Downloads/task3_probe_late_entry.diff` (patch, applies to `af462ef`) gates the cap on the
+sign filling 6000 px^2 of the frame instead of on first sight, and holds the cap to the parking
+hand-over as before. With the probe applied `task3/task3.py` is
+`f0c1d3772124e67716d1dcdffba27c3628c30a24c9627750e45512abdcc229fa`.
+
+| Rehearsal | Build | Cap engages | Parked | Bay sign clearance | Top board clearance |
+| --- | --- | --- | --- | --- | --- |
+| `base-bay-1` | `fcbb86ae` (graded) | 0.71 m from the board | 228.80 s | 29.2 mm | 96.6 mm |
+| `entry-probe-1` | `f0c1d377` (probe) | 0.327 m from the board | **200.45 s** | 20.0 mm | 93.0 mm |
+
+Clearances above are true minimum mesh distances from `sim.checkDistance` at each run's
+closest pose, not centre distances. The probe is 10 mm tighter at the bay sign and still has
+20 mm of air, which is more than the -9.8 mm the graded run was forgiven at that same corner.
+Obstacle passes are unchanged (0.206-0.210 m), the halt still holds 5.2 s in one event, the two
+lane changes are the same, and the capped window has **0 frames** above 1.22 rad/s.
+
+`check_task3.py`: 89 of 90 pass. The one failure is
+`test_first_sight_caps_even_distant_sign`, which asserts the old rule (cap on a distant sight);
+it encodes the behaviour the probe deliberately removes, so it is expected, not a regression.
+
+The entry is area-triggered, not timeout: the controller printed no `zone entry fallback`
+line, so the cap fired because the board filled the frame 0.327 m out. That is geometry, so it
+reproduces on a real run rather than depending on a timer.
+
+**What is being bet.** The graded log shows the old build capping at a marker range of 0.71 m
+(area 884 px^2). `SPEED 20/20` there proves the zone does not begin before that point, so the
+true zone start lies in the 0.38 m between 0.71 m and the probe's 0.327 m - about 4.2 s at
+3.0 rad/s. If the evaluator starts the zone at the board's plane (the rubric's "just before the
+first sign"), the probe is clean and saves 10.2 s of crawl plus ~7 s of parking. If it starts
+further out, those ~4.2 s are over the limit and SPEED costs up to 20 marks against a ~5-14
+mark gain.
+
+Per the marks table, time is -0.5 per second, so the 28.35 s saved is worth about +14 marks
+(59.50 -> ~73/80) provided the entry is free.
+
+To revert: `git checkout -- task3/task3.py` restores `fcbb86ae`, the banked build.
 
 
 ## The arena file
