@@ -13,6 +13,11 @@ that run maxed four of the five blocks:
 | PARKING | 10.00 / 10 |
 | TIME | 0 / 25, **-25.62** (3 min 51 s, 51 s over) |
 
+Three graded runs and a calibration of the zone entry are recorded below. Run `1f2383d0f92e`
+scored 50.84 with a late entry, which measured where the zone actually starts (~0.50 m from the
+top board) and sized the calibrated build that should score 63-65. The best score kept is still
+59.50.
+
 The best score is kept, so anything below this can be ignored. The only remaining loss is
 time, and the analysis below says most of it is structural - except for a probe build, in
 *Probe build: a later zone entry*, which rehearses clean at 200.45 s but leans on the zone
@@ -214,6 +219,46 @@ Per the marks table, time is -0.5 per second, so the 28.35 s saved is worth abou
 (59.50 -> ~73/80) provided the entry is free.
 
 To revert: `git checkout -- task3/task3.py` restores `fcbb86ae`, the banked build.
+
+## Third graded run: the probe overshot, and it measured the zone
+
+The probe was graded as run `1f2383d0f92e`: **63.55/100 = 50.84/80**. HALT 50/50 (6.0 s),
+SPEED **0/20** with `SPEED LIMITS -2.50` (2.5 s over 1.2 rad/s, top 2.97), NO COLLISION 20/20,
+PARKING 10/10, TIME -13.95 (3 min 28 s). The best score is kept, so 59.50 still stands, and the
+run bought the one number this project could not otherwise obtain.
+
+**Where the zone starts.** The cap fired at 65.15 s on area 6176 / `r=0.34`, and the evaluator
+counted 2.5 s over the limit before that, so the zone began at about 62.65 s. The controller log
+reads `r=0.48` at 62.60 s and `r=0.49` at 62.45 s there, and the distance actually travelled in
+those 2.5 s at 3.0 rad/s puts the same point at ~0.47 m. So the zone starts **0.47-0.52 m from
+the top-bend board**, not 1.08 m.
+
+That resolves the whole time question. The banked build caps at first sight (1.08 m), which is
+0.58 m of unnecessary crawl at 0.0256 m/s - about 23 s. It also explains the measured finish:
+`-1` s per 0.043 m of entry, and the 23.55 s gap between the banked and probe runs came almost
+entirely from the entry, not from parking.
+
+**The calibrated build.** `ZONE_ENTRY_RANGE = 0.60` engages on measured sign range instead of
+pixel area, which the area curve cannot do (it dips to 596 px^2 mid-approach and has no usable
+monotone segment). Rehearsal `range-entry-1`:
+
+| Item | Result |
+| --- | --- |
+| Entry | 52.00 s at `r=0.60`, true distance 0.723 m - a 0.22 m margin |
+| Parked | **212.45 s** (graded build 228.80 s on the same harness) |
+| Frames above 1.22 rad/s in the capped window | **0** |
+| Halt | one event, held 5.2 s |
+| Bay sign clearance | 15.2 mm (graded 29.2 mm, area probe 20.0 mm) |
+| Obstacles | 0.206-0.212 m, unchanged |
+
+Real runs have finished 5-10 s slower than the rehearsal, so the graded expectation is
+218-223 s, or **63-65/80** - about 5 marks over the banked 59.50. The remaining 0.22 m of
+margin costs ~2.5 marks; tightening to `r=0.50` would recover it but leaves only ~0.10 m before
+the zone, which is not a sensible trade against a 20-mark block.
+
+Watch the bay sign: its clearance has fallen 29.2 -> 20.0 -> 15.2 mm across the three builds as
+the entry shifts the approach pose. It is still clear, and the previous run at 20 mm scored
+NO COLLISION, but another 15 mm of drift there is the one thing that could cost 30 marks.
 
 
 ## The arena file

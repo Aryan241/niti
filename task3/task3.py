@@ -80,7 +80,7 @@ ZONE_LIMIT    = 1.2                  # rad/s between the two Speed 40 signs
 CRUISE        = SPEED_LIMIT          # use the permitted global cap outside the zone
 ZONE_CRUISE   = 1.20                 # exact task cap while the Speed 40 zone is active
 ZONE_NEAR_RANGE  = 0.65           # m, evidence that the current sign was approached
-ZONE_ENTRY_AREA  = 6000           # px^2, the entry board seen close enough to be passed now
+ZONE_ENTRY_RANGE = 0.60           # m, engage once the entry board is this close
 ZONE_ENTRY_WAIT  = 26.0           # s, engage anyway if that close look never arrives
 
 HALT_SECONDS      = 5.0              # required stationary time (simulation time)
@@ -1395,18 +1395,24 @@ class Mission:
         # PROBE: the entry board stands on the top bend, so a distant first
         # glimpse is ~1.1 m of road before the zone can start. Engage on the
         # close look at that board instead, with a bounded fallback so a missed
-        # close look can never leave the zone uncapped.
+        # close look can never leave the zone uncapped. The graded run of
+        # 1f2383d0f92e puts the zone start at about 0.50 m from the board, so
+        # 0.60 m keeps a margin while giving back the rest of the crawl.
         if speed40 and self.zone_first_sight is None:
             self.zone_first_sight = now
         if self.zone or self.zone_speed_hold or self.zone_done:
             enter_ok = True
         else:
-            close = max([s["area"] for s in speed40] or [0]) >= ZONE_ENTRY_AREA
+            ranges = [estimate_sign_range(s["bbox"])[0] for s in speed40]
+            ranges = [r for r in ranges if np.isfinite(r) and r > 0]
+            close = bool(ranges) and min(ranges) <= ZONE_ENTRY_RANGE
             waited = (self.zone_first_sight is not None and
                       now - self.zone_first_sight >= ZONE_ENTRY_WAIT)
             enter_ok = close or waited
-            if enter_ok and not close:
-                self.note(now, 'zone entry fallback after %.1f s' % (now - self.zone_first_sight))
+            if enter_ok:
+                self.note(now, 'zone entry at %.2f m%s' % (
+                    min(ranges) if ranges else -1.0,
+                    '' if close else ' (fallback after %.1f s)' % (now - self.zone_first_sight)))
         fired = self.speed40.update(speed40, now, self.frame_dt, self.frame_travel,
                                     confirmed=normal_speed40 or bool(weak_speed40)) if enter_ok else False
         if fired:
